@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import json
+import wave
+import multiprocessing as mp
+import threading
+import psutil
+import yt_dlp
+import subprocess
+import re
+import warnings
+import logging
+from datetime import datetime
+from pathlib import Path
+from vosk import Model, KaldiRecognizer
+import signal
+from queue import Queue
+import shutil
+import time
+import argparse
+import torch
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+logging.getLogger("speechbrain").setLevel(logging.ERROR)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+CREDENTIALS_DIR = os.path.expanduser("~/credentials/hugface_pyannote.audio")
+TOKEN_FILE = "hf_token"
+TOKEN_PATH = os.path.abspath(os.path.join(CREDENTIALS_DIR, TOKEN_FILE))
+
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+
+# Global variables for resource monitoring
+resource_monitor_stop_event = None
+resource_monitor_thread = None
+download_in_progress = False
+max_threads = 1
+net_speed = 0  # Add this line
+CONFIG_FILE = "vosk_config.json"
+VOSK_DIR = os.path.expanduser("~/vosk/")
+
+def check_dependencies():
+    missing = []
+    for module in ["yt_dlp", "vosk", "psutil", "pyannote.audio", "torch", "fcntl", "termios"]:
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    if missing:
+        logging.error(f"Missing dependencies: {', '.join(missing)}")
+        sys.exit(1)
+    try:
+        subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.error("ffmpeg required. Install: sudo apt install ffmpeg")
+        sys.exit(1)
+    logging.info("Dependencies checked - all good")
+
+def format_bytes(size):
+    if size < 0:
+        raise ValueError("Size must be a non-negative number.")
+    
+    units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+    base = 1024  # Use 1000 for decimal (e.g., KB=1000), 1024 for binary (e.g., KiB)
+    n = 0
+    # Convert size to float for division and is_integer check
+    size = float(size)
+
+    # Loop only advances if size is >= base *after* division
+    while n < len(units) - 1 and size >= base:
+        size /= base
+        n += 1
+    
+    # Format to 0 decimal places if whole number, else 2
+    precision = 0 if size.is_integer() else 2
+    return f"{size:.{precision}f} {units[n]}"
+"""
+def format_bytes(size):
+    if size < 0:
+        raise ValueError("Size must be a non-negative number.")
+    
+    units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+    power = 1024
+    n = 0
+    
+    while size >= power and n < len(units) - 1:
+        size /= power
+        n += 1
+    
+    return f"{size:.2f} {units[n]}"
+
+def format_bytes(size):
+    # Convert bytes to a human-readable format
+    power = 1024
+    n = 0
+    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    while size > power and n < len(units) - 1:
+        size /= power
+        n += 1
+
+    if size < 1 and n > 0:
+        size *= power
+        n -= 1
+    return f"{size:.2f} {units[n]}"
+"""
+
+def setup_terminal_monitor():
+    # Set up terminal for monitoring
+    fd = sys.stdout.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] = new[3] & ~termios.ECHO  # Disable echo
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+    
+    # Enable mouse tracking and screen region monitoring
+    sys.stdout.write('\033[?1003h\033[?1015h\033[?1006h')
+    sys.stdout.flush()
+    return old, fd
+
+def monitor_stats_area(stop_event, cpu_position):
+    def check_region(report):
+        if report.startswith('\033[M') and len(report) >= 6:
+            col = ord(report[4]) - 32
+            if col >= cpu_position:
+                refresh_resource_stats()
+    
+    old_settings, fd = setup_terminal_monitor()
+    try:
+        while not stop_event.is_set():
+            if select.select([sys.stdin], [], [], 0)[0]:
+                report = sys.stdin.read(6)
+                check_region(report)
+    finally:
+        # Restore terminal settings
+        termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        sys.stdout.write('\033[?1003l\033[?1015l\033[?1006l')
+        sys.stdout.flush()
+"""
+def refresh_resource_stats():
+    # Immediate refresh of resource stats when area is modified
+    cpu_percent = psutil.cpu_percent(interval=0)
+    mem_info = psutil.virtual_memory()
+    swap_info = psutil.swap_memory()
+    
+    resource_str = (f"CPU: {cpu_percent:5.1f}% "
+                   f"RAM: {mem_info.percent:5.1f}% "
+                   f"Swap: {swap_info.percent:5.1f}% "
+                   f"Threads: {max_threads}")
+    
+    terminal_width = shutil.get_terminal_size().columns
+    cpu_position = terminal_width - len(resource_str) + 1
+    
+    if download_in_progress:
+        net_str = f"Net: {net_speed:5.1f}MB/s "
+        net_position = cpu_position - len(net_str)
+        sys.stdout.write(f"\033[{net_position}G{net_str}")
+    
+    sys.stdout.write(f"\033[{cpu_position}G{resource_str}")
+    sys.stdout.flush()
+"""
+def refresh_resource_stats():
+    cpu_percent = psutil.cpu_percent(interval=0)
+    mem_info = psutil.virtual_memory()
+    swap_info = psutil.swap_memory()
+
+    resource_str = (f" CPU: {cpu_percent:.1f}% "
+                    f"RAM: {format_bytes(mem_info.used)}/{format_bytes(mem_info.total)} "
+                    f"Swap: {format_bytes(swap_info.used)}/{format_bytes(swap_info.total)} "
+                    f"Threads: {max_threads}")
+
+    terminal_width = shutil.get_terminal_size().columns
+    cpu_position = terminal_width - len(resource_str)
+
+    if download_in_progress:
+        net_str = f" Net: {format_bytes(net_speed)}/s "
+        net_position = cpu_position - len(net_str)
+        sys.stdout.write(f"\033[{net_position}G{net_str}")
+
+    sys.stdout.write(f"\033[{cpu_position}G{resource_str}")
+    sys.stdout.flush()
+
+
+
+def check_resources():
+    resources = {
+        "cores": mp.cpu_count(),
+        "ram": psutil.virtual_memory().total / (1024**3),
+        "swap": psutil.swap_memory().total / (1024**3),
+        "gpu": "No"
+    }
+    if torch.cuda.is_available():
+        resources["gpu"] = torch.cuda.get_device_name(0)
+    return resources
+
+def load_config(available_ram):
+    global max_threads
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+    else:
+        # Scale threads based on available RAM and CPU cores
+        max_threads = min(
+            mp.cpu_count(),
+            max(1, int(available_ram / 2))
+        )
+        config = {
+            "model_path": os.path.join(VOSK_DIR, "vosk-model-en-us-0.22"),
+            "last_model": None,
+            "max_threads": max_threads
+        }
+        save_config(config)
+    max_threads = config["max_threads"]
+    return config
+
+def save_config(config):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+def load_hf_token():
+    logging.info(f"Checking token path: {TOKEN_PATH}")
+    if not os.path.exists(CREDENTIALS_DIR):
+        os.makedirs(CREDENTIALS_DIR)
+        logging.error(f"Created credentials directory: {CREDENTIALS_DIR}")
+        logging.error(f"Please place your HuggingFace token in {TOKEN_PATH}")
+        sys.exit(1)
+    logging.info(f"Directory contents: {os.listdir(CREDENTIALS_DIR)}")
+    if not os.path.exists(TOKEN_PATH):
+        logging.error(f"Token file not found at {TOKEN_PATH}")
+        sys.exit(1)
+    with open(TOKEN_PATH, "r") as f:
+        token = f.read().strip()
+    logging.info("Token loaded successfully")
+    return token
+
+def start_resource_monitoring(max_threads):
+    global resource_monitor_stop_event, resource_monitor_thread
+    if resource_monitor_stop_event is None:
+        resource_monitor_stop_event = threading.Event()
+        resource_monitor_thread = threading.Thread(target=monitor_resources, args=(resource_monitor_stop_event,))
+        resource_monitor_thread.daemon = True
+        resource_monitor_thread.start()
+
+def stop_resource_monitoring():
+    global resource_monitor_stop_event, resource_monitor_thread
+    if resource_monitor_stop_event:
+        resource_monitor_stop_event.set()
+    if resource_monitor_thread:
+        resource_monitor_thread.join()
+        resource_monitor_thread = None
+    # Clear any remaining content on the current line
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+"""
+def monitor_resources(stop_event):
+    while not stop_event.is_set():
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem_info = psutil.virtual_memory()
+        swap_info = psutil.swap_memory()
+        terminal_width = shutil.get_terminal_size().columns
+        
+        resource_str = (f"CPU: {cpu_percent:5.1f}% "
+                       f"RAM: {mem_info.percent:5.1f}% "
+                       f"Swap: {swap_info.percent:5.1f}% "
+                       f"Threads: {max_threads}")
+        
+        # Position cursor directly using ANSI code
+        position = terminal_width - len(resource_str) + 1
+        sys.stdout.write(f"\033[{position}G{resource_str}")
+        sys.stdout.flush()
+        time.sleep(0.1)
+
+def monitor_resources(stop_event):
+    while not stop_event.is_set():
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem_info = psutil.virtual_memory()
+        swap_info = psutil.swap_memory()
+        terminal_width = shutil.get_terminal_size().columns
+        
+        resource_str = (f"CPU: {cpu_percent:5.1f}% "
+                       f"RAM: {mem_info.percent:5.1f}% "
+                       f"Swap: {swap_info.percent:5.1f}% "
+                       f"Threads: {max_threads}")
+        
+        # Position cursor directly using ANSI code
+        position = terminal_width - len(resource_str) + 1
+        sys.stdout.write(f"\033[{position}G{resource_str}")
+        sys.stdout.flush()
+        time.sleep(0.1)
+
+def monitor_resources(stop_event):
+    while not stop_event.is_set():
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem_info = psutil.virtual_memory()
+        swap_info = psutil.swap_memory()
+        terminal_width = shutil.get_terminal_size().columns
+        
+        resource_str = (f"CPU: {cpu_percent:5.1f}% "
+                       f"RAM: {mem_info.percent:5.1f}% "
+                       f"Swap: {swap_info.percent:5.1f}% "
+                       f"Threads: {max_threads}")
+        
+        cpu_position = terminal_width - len(resource_str) + 1
+        
+        if download_in_progress:
+            net_str = f"Net: {net_speed:5.1f}MB/s "
+            net_position = cpu_position - len(net_str)
+            sys.stdout.write(f"\033[{net_position}G{net_str}")
+            
+        sys.stdout.write(f"\033[{cpu_position}G{resource_str}")
+        sys.stdout.flush()
+        time.sleep(0.1)
+"""
+def monitor_resources(stop_event):
+    while not stop_event.is_set():
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        mem_info = psutil.virtual_memory()
+        swap_info = psutil.swap_memory()
+        terminal_width = shutil.get_terminal_size().columns
+
+        resource_str = (f"CPU: {cpu_percent:.1f}% "
+                        f"RAM: {format_bytes(mem_info.used)}/{format_bytes(mem_info.total)} "
+                        f"Swap: {format_bytes(swap_info.used)}/{format_bytes(swap_info.total)} "
+                        f"Threads: {max_threads}")
+
+        cpu_position = terminal_width - len(resource_str) + 1
+
+        if download_in_progress:
+            net_str = f"Net: {format_bytes(net_speed)}/s "
+            net_position = cpu_position - len(net_str)
+            sys.stdout.write(f"\033[{net_position}G{net_str}")
+
+        sys.stdout.write(f"\033[{cpu_position}G{resource_str}")
+        sys.stdout.flush()
+        time.sleep(0.1)
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("Diarization process timed out")
+"""
+def progress_hook(*args, **kwargs):
+    completed = kwargs.get("completed", args[0] if args else 0)
+    total = kwargs.get("total", args[1] if len(args) > 1 else 0)
+    if isinstance(completed, int) and isinstance(total, int):
+        progress_msg = f"Diarization progress: {completed}/{total} chunks processed"
+        sys.stdout.write(f"\033[1G{progress_msg}\033[4X")
+        sys.stdout.flush()
+
+def progress_hook(*args, **kwargs):
+    completed = kwargs.get("completed", args[0] if args else 0)
+    total = kwargs.get("total", args[1] if len(args) > 1 else 0)
+    if isinstance(completed, int) and isinstance(total, int):
+        progress_msg = f"Diarization progress: {completed}/{total} chunks processed"
+        sys.stdout.write(f"\033[1G{progress_msg}\033[4X")
+        sys.stdout.flush()
+"""
+def progress_hook(*args, **kwargs):
+    completed = kwargs.get("completed", args[0] if args else 0)
+    total = kwargs.get("total", args[1] if len(args) > 1 else 0)
+    if isinstance(completed, int) and isinstance(total, int):
+        progress_msg = f"Diarization progress: {completed}/{total} chunks processed"
+        sys.stdout.write(f"\033[1G{progress_msg}\033[4X")
+        sys.stdout.flush()
+
+def convert_to_wav(input_file, output_file="./temp/converted_audio.wav"):
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    command = [
+        "ffmpeg", "-loglevel", "error", "-i", input_file,
+        "-acodec", "pcm_s16le",
+        "-ac", "1",
+        "-ar", "16000",
+        output_file,
+        "-y"
+    ]
+    logging.info("Converting audio to WAV format...")
+    result = subprocess.run(command, capture_output=True, text=True)
+    logging.info("FFmpeg output: " + result.stderr.strip())
+    logging.info(f"Converted to {output_file}")
+    return output_file
+
+def download_video(url, output_dir="./temp/"):
+    global download_in_progress
+    logging.info(f"Starting download from {url}")
+    os.makedirs(output_dir, exist_ok=True)
+    download_in_progress = True
+    ydl_opts = { 
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_dir, "%(extractor)s-%(id)s.%(ext)s"),
+        "quiet": True,
+        "noplaylist": True,
+        "progress_hooks": [download_progress_hook],
+        'retries': 1000,  # Effectively retry indefinitely (yt-dlp has no "infinite" option)
+        'fragment_retries': 1000,  # Retry failed fragments up to 1000 times
+        'retry_sleep_functions': {
+            'http_error': lambda x: min(30 * (2 ** x), 300),  # Exponential backoff: starts at 30s, max 5 min
+            'fragment': lambda x: min(15 * (2 ** x), 120),  # Exponential backoff for fragments: starts at 15s, max 2 min
+        },
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            channel = info.get("channel") or info.get("uploader") or "UnknownChannel"
+            audio_file = os.path.join(output_dir, f"{info['extractor'].split(':')[0]}-{info['id']}.{info['ext']}")
+            logging.info(f"Downloaded audio to {audio_file}")
+            download_in_progress = False
+            return (audio_file, info["id"], info["extractor"].split(":")[0], info["title"], channel)
+    except yt_dlp.utils.DownloadError as e:
+        logging.error(f"Download failed: {e}")
+        download_in_progress = False
+        sys.exit(1)
+"""
+def download_progress_hook(d):
+    if d['status'] == 'downloading':
+        progress = f"[download] {d['_percent_str']} of {d['_total_bytes_str']} at {d['_speed_str']} ETA {d['_eta_str']}"
+        sys.stdout.write(f"\033[1G{progress}")
+        sys.stdout.flush()
+
+def download_progress_hook(d):
+    if d['status'] == 'downloading':
+        progress = f"[download] {d['_percent_str']} of {d['_total_bytes_str']} at {d['_speed_str']} ETA {d['_eta_str']}"
+        sys.stdout.write(f"\033[1G{progress}")
+        sys.stdout.flush()
+"""
+def download_progress_hook(d):
+    global net_speed
+    if d['status'] == 'downloading':
+       # net_speed = float(d['speed']) / 1024 / 1024 if d['speed'] else 0  # Convert to MB/s
+        net_speed = float(d['speed']) if d['speed'] else 0  # bytes/s
+        progress = f"[download] {d['_percent_str']} of {d['_total_bytes_str']} at {d['_speed_str']} ETA {d['_eta_str']}"
+        sys.stdout.write(f"\033[1G{progress}")
+        sys.stdout.flush()
+
+def transcribe_chunk(wav_file, start_frame, end_frame, config, result_queue, chunk_id):
+    wf = wave.open(wav_file, "rb")
+    wf.setpos(start_frame)
+    chunk_frames = end_frame - start_frame
+    
+    model = Model(config["model_path"])
+    rec = KaldiRecognizer(model, wf.getframerate())
+    rec.SetWords(True)
+    
+    chunk_data = wf.readframes(chunk_frames)
+    rec.AcceptWaveform(chunk_data)
+    result = rec.Result()
+    result_dict = json.loads(result)
+    text = result_dict.get("text", "")
+    
+    result_queue.put((chunk_id, text))
+    wf.close()
+
+
+def diarize_and_transcribe(audio_file, platform, video_id, title, channel, config, monitor_resources_flag):
+    global max_threads
+    output_dir = "./transcripts/"
+    os.makedirs(output_dir, exist_ok=True)
+    title_slug = re.sub(r'[^a-zA-Z0-9 ]', '', title).replace(" ", "-")[:30]
+    channel_slug = re.sub(r'[^a-zA-Z0-9]', '', channel)[:20]
+    title_slug = title_slug.strip('-')
+    channel_slug = channel_slug.strip('-')
+    filename = f"{channel_slug}-{title_slug}-{video_id}.txt"
+    outfile = os.path.join(output_dir, filename)
+
+    wav_file = convert_to_wav(audio_file)
+    wf = wave.open(wav_file, "rb")
+    sample_rate = wf.getframerate()
+
+    logging.info("Starting Pyannote diarization with speaker-diarization-3.1")
+    
+    # Stop the current resource monitoring and clear the line
+    stop_resource_monitoring()
+    
+    # Start fresh resource monitoring for diarization phase
+    if monitor_resources_flag:
+        start_resource_monitoring(max_threads)
+    
+    try:
+        from pyannote.audio import Pipeline
+        import pyannote.audio
+        logging.info(f"Pyannote version: {pyannote.audio.__version__}")
+        hf_token = load_hf_token()
+        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+        pipeline.instantiate({"clustering": {"method": "centroid", "threshold": 0.6}})
+        logging.info("Pipeline loaded, processing audio...")
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(3600)
+        if psutil.virtual_memory().percent > 90:
+            logging.warning("RAM usage >90%—pausing diarization for 10s")
+            time.sleep(10)
+        diarization = pipeline(wav_file, hook=progress_hook)
+        signal.alarm(0)
+        segments = list(diarization.itertracks(yield_label=True))
+        logging.info(f"Diarization complete - found {len(segments)} segments")
+        for i, (turn, _, speaker) in enumerate(segments):
+            logging.info(f"Segment {i}: Speaker {speaker}, Start {turn.start:.2f}s, End {turn.end:.2f}s")
+    except Exception as e:
+        logging.error(f"Pyannote diarization failed: {e}")
+        raise
+
+    result_queue = Queue()
+    segment_queue = Queue()
+    active_threads = []
+    for i, (turn, _, speaker) in enumerate(segments):
+        segment_queue.put((i, turn.start, turn.end, speaker))
+
+    def worker():
+        while True:
+            try:
+                chunk_id, start, end, speaker = segment_queue.get_nowait()
+                start_frame = int(start * sample_rate)
+                end_frame = int(end * sample_rate)
+                t = threading.Thread(target=transcribe_chunk, args=(wav_file, start_frame, end_frame, config, result_queue, chunk_id))
+                t.start()
+                active_threads.append(t)
+                while len(active_threads) >= max_threads:
+                    for t in active_threads[:]:
+                        if not t.is_alive():
+                            t.join()
+                            active_threads.remove(t)
+                    time.sleep(0.1)
+            except:
+                break
+
+    num_workers = min(max_threads, len(segments))
+    workers = [threading.Thread(target=worker) for _ in range(num_workers)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    for t in active_threads:
+        t.join()
+
+    sys.stdout.write("\033[K")
+    sys.stdout.flush()
+
+    results = [result_queue.get() for _ in range(len(segments))]
+    results.sort(key=lambda x: x[0])
+
+    merged_segments = []
+    current_speaker = None
+    current_text = ""
+    for chunk_id, text in results:
+        speaker = segments[chunk_id][2]
+        if text.strip():
+            if speaker != current_speaker and current_speaker is not None:
+                merged_segments.append((current_speaker, current_text.strip()))
+                current_text = text
+            else:
+                current_text += " " + text
+            current_speaker = speaker
+    if current_text.strip():
+        merged_segments.append((current_speaker, current_text.strip()))
+
+    transcript = ""
+    for speaker, text in merged_segments:
+        transcript += f"[Speaker {speaker}]: {text}\n"
+
+    logging.info(f"Writing transcript to {outfile}")
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write(transcript)
+
+    if "--cleanup" in sys.argv:
+        logging.info("Cleaning up temporary files")
+        os.remove(audio_file)
+        os.remove(wav_file)
+
+    config["last_model"] = config["model_path"]
+    save_config(config)
+    logging.info(f"Transcript saved: {outfile}")
+    return filename
+
+def main():
+    parser = argparse.ArgumentParser(description="Transcribe and diarize audio from a video URL.")
+    parser.add_argument("video_url", help="URL of the video to process.")
+    parser.add_argument("--cleanup", action="store_true", help="Clean up temporary files after processing.")
+    parser.add_argument("--monitor-resources", action="store_true", help="Monitor system resources.")
+    args = parser.parse_args()
+
+    check_dependencies()
+    resources = check_resources()
+    config = load_config(resources["ram"])
+    
+    model_path = config["model_path"]
+    if not os.path.exists(model_path) or not os.path.exists(os.path.join(model_path, "conf/model.conf")):
+        logging.error(f"Vosk model incomplete at {model_path}. Missing conf/model.conf. Download from https://alphacephei.com/vosk/models")
+        sys.exit(1)
+
+    # Start resource monitoring early if requested
+    if args.monitor_resources:
+        start_resource_monitoring(max_threads)
+
+    logging.info(f"OpenBLAS threads set to: {os.environ.get('OPENBLAS_NUM_THREADS', 'Not set')}")
+    logging.info(f"Processing {args.video_url} with {resources['cores']} cores, RAM: {resources['ram']:.1f}GB, Swap: {resources['swap']:.1f}GB, GPU: {resources['gpu']}, Diarizer: Pyannote")
+    logging.info(f"Using {config['max_threads']} transcription threads (1 per 2GB RAM, max 4). CLOSE ALL OTHER APPS to avoid memory issues!")
+    logging.info(f"Estimated peak RAM: ~10GB (diarization) + {config['max_threads'] * 2}GB (transcription).")
+
+    try:
+        audio_file, video_id, platform, title, channel = download_video(args.video_url)
+        transcript_file = diarize_and_transcribe(audio_file, platform, video_id, title, channel, config, args.monitor_resources)
+        print(f"Transcript saved: {transcript_file}")
+    finally:
+        if args.monitor_resources:
+            stop_resource_monitoring()
+
+if __name__ == "__main__":
+    main()
