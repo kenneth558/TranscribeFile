@@ -43,21 +43,74 @@ net_speed = 0  # Add this line
 CONFIG_FILE = "vosk_config.json"
 VOSK_DIR = os.path.expanduser("~/vosk/")
 
-def check_dependencies():
+def check_dependencies(is_gdrive=False):
+    """
+    Check that all required dependencies are installed, including optional Google Drive dependencies if needed.
+    """
     missing = []
-    for module in ["yt_dlp", "vosk", "psutil", "pyannote.audio", "torch", "fcntl", "termios"]:
+    required_modules = [
+        "yt_dlp", "vosk", "psutil", "torch", "wave",
+        "multiprocessing", "threading", "queue", "argparse",
+        "json", "re", "subprocess", "shutil", "signal", "logging",
+        "pathlib", "datetime"
+    ]
+
+    # Add Google Drive-specific modules if needed
+    if is_gdrive:
+        required_modules.extend(["gdown", "pydrive"])
+
+    for module in required_modules:
         try:
             __import__(module)
         except ImportError:
             missing.append(module)
+
     if missing:
         logging.error(f"Missing dependencies: {', '.join(missing)}")
         sys.exit(1)
+    
+    # Check for ffmpeg installation
     try:
         subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except (subprocess.CalledProcessError, FileNotFoundError):
         logging.error("ffmpeg required. Install: sudo apt install ffmpeg")
         sys.exit(1)
+
+    logging.info("Dependencies checked - all good")
+
+def check_dependencies(is_gdrive=False):
+    """
+    Check that all required dependencies are installed, including optional Google Drive dependencies if needed.
+    """
+    missing = []
+    required_modules = [
+        "yt_dlp", "vosk", "psutil", "torch", "wave",
+        "multiprocessing", "threading", "queue", "argparse",
+        "json", "re", "subprocess", "shutil", "signal", "logging",
+        "pathlib", "datetime"
+    ]
+
+    # Add Google Drive-specific modules if needed
+    if is_gdrive:
+        required_modules.extend(["gdown", "pydrive"])
+
+    for module in required_modules:
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+
+    if missing:
+        logging.error(f"Missing dependencies: {', '.join(missing)}")
+        sys.exit(1)
+    
+    # Check for ffmpeg installation
+    try:
+        subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.error("ffmpeg required. Install: sudo apt install ffmpeg")
+        sys.exit(1)
+
     logging.info("Dependencies checked - all good")
 
 def format_bytes(size):
@@ -573,16 +626,22 @@ def diarize_and_transcribe(audio_file, platform, video_id, title, channel, confi
     return filename
 
 def main():
-    parser = argparse.ArgumentParser(description="Transcribe and diarize audio from a video URL.")
-    parser.add_argument("video_url", help="URL of the video to process.")
+    parser = argparse.ArgumentParser(description="Transcribe and diarize audio files or process a FIFO file.")
+    parser.add_argument("input", help="Target file name (local or Google Drive) or a FIFO file listing multiple targets.")
     parser.add_argument("--cleanup", action="store_true", help="Clean up temporary files after processing.")
     parser.add_argument("--monitor-resources", action="store_true", help="Monitor system resources.")
+    parser.add_argument("--gdrive-folder-id", help="Google Drive folder ID to save transcripts.", required=False)
     args = parser.parse_args()
 
-    check_dependencies()
+    # Determine if the input is a Google Drive link
+    is_gdrive = args.input.startswith("https://drive.google.com")
+
+    # Check dependencies
+    check_dependencies(is_gdrive)
+
     resources = check_resources()
     config = load_config(resources["ram"])
-    
+
     model_path = config["model_path"]
     if not os.path.exists(model_path) or not os.path.exists(os.path.join(model_path, "conf/model.conf")):
         logging.error(f"Vosk model incomplete at {model_path}. Missing conf/model.conf. Download from https://alphacephei.com/vosk/models")
@@ -593,17 +652,60 @@ def main():
         start_resource_monitoring(max_threads)
 
     logging.info(f"OpenBLAS threads set to: {os.environ.get('OPENBLAS_NUM_THREADS', 'Not set')}")
-    logging.info(f"Processing {args.video_url} with {resources['cores']} cores, RAM: {resources['ram']:.1f}GB, Swap: {resources['swap']:.1f}GB, GPU: {resources['gpu']}, Diarizer: Pyannote")
-    logging.info(f"Using {config['max_threads']} transcription threads (1 per 2GB RAM, max 4). CLOSE ALL OTHER APPS to avoid memory issues!")
-    logging.info(f"Estimated peak RAM: ~10GB (diarization) + {config['max_threads'] * 2}GB (transcription).")
+    logging.info(f"Using {config['max_threads']} transcription threads. CLOSE ALL OTHER APPS to avoid memory issues!")
 
     try:
-        audio_file, video_id, platform, title, channel = download_video(args.video_url)
-        transcript_file = diarize_and_transcribe(audio_file, platform, video_id, title, channel, config, args.monitor_resources)
-        print(f"Transcript saved: {transcript_file}")
+        if args.input.upper() == "FIFO" or is_gdrive:
+            fifo_path = args.input
+            if is_gdrive:
+                fifo_path = download_gdrive_file(args.input)
+                
+            if not os.path.exists(fifo_path):
+                logging.error(f"FIFO file {fifo_path} not found.")
+                sys.exit(1)
+
+            while True:
+                with open(fifo_path, "r") as fifo_file:
+                    lines = fifo_file.readlines()
+
+                if not lines:
+                    logging.info("FIFO file is empty. Exiting.")
+                    break
+
+                target = lines[0].strip()
+                if target:
+                    try:
+                        audio_file, video_id, platform, title, channel = download_video(target)
+                        transcript_file = diarize_and_transcribe(audio_file, platform, video_id, title, channel, config, args.monitor_resources)
+                        logging.info(f"Processed and saved transcript: {transcript_file}")
+
+                        # Upload transcript to Google Drive if folder ID is provided
+                        if args.gdrive_folder_id:
+                            upload_to_gdrive(f"./transcripts/{transcript_file}", args.gdrive_folder_id)
+
+                        # Remove the processed entry from FIFO
+                        with open(fifo_path, "w") as fifo_file:
+                            fifo_file.writelines(lines[1:])
+
+                    except Exception as e:
+                        logging.error(f"Failed to process {target}: {e}")
+
+        else:
+            if is_gdrive:
+                local_file = download_gdrive_file(args.input)
+            else:
+                local_file = args.input
+
+            audio_file, video_id, platform, title, channel = download_video(local_file)
+            transcript_file = diarize_and_transcribe(audio_file, platform, video_id, title, channel, config, args.monitor_resources)
+            print(f"Transcript saved: {transcript_file}")
+
+            # Upload transcript to Google Drive if folder ID is provided
+            if args.gdrive_folder_id:
+                upload_to_gdrive(f"./transcripts/{transcript_file}", args.gdrive_folder_id)
+
     finally:
         if args.monitor_resources:
             stop_resource_monitoring()
-
 if __name__ == "__main__":
     main()
