@@ -1,0 +1,1760 @@
+#!/usr/bin/env python3
+
+# --- Standard Library Imports ---
+import asyncio
+import atexit
+import argparse
+import contextlib
+import datetime
+import hashlib
+import io
+import json
+import logging
+import multiprocessing as mp
+import os
+import platform
+import queue # Use full name for clarity
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+import warnings
+import wave
+from collections import defaultdict
+from dataclasses import dataclass, field
+from queue import Empty # Specific import
+
+# --- Version Check ---
+if sys.version_info < (3, 7): sys.exit("Python 3.7+ required")
+
+# --- Platform Detection ---
+IS_LINUX = sys.platform.startswith('linux'); IS_WINDOWS = sys.platform.startswith('win')
+if not IS_LINUX and not IS_WINDOWS: sys.exit("Error: Only Linux/Windows supported")
+
+# --- Platform-Specific Imports ---
+if IS_LINUX: import fcntl
+elif IS_WINDOWS: import msvcrt
+
+# --- Third-Party Library Imports (Attempted, Checked Later) ---
+# Define placeholders first
+psutil = None; torch = None; yt_dlp = None; Model = None; KaldiRecognizer = None
+GOOGLE_DRIVE_ENABLED = False; HttpError = None; MediaFileUpload = None
+MediaIoBaseDownload = None; service_account = None; build = None; Pipeline = None
+
+try: import psutil
+except ImportError: logging.debug("Import attempt failed for: psutil")
+try: import torch
+except ImportError: logging.debug("Import attempt failed for: torch")
+try: import yt_dlp
+except ImportError: logging.debug("Import attempt failed for: yt_dlp")
+try: from vosk import Model, KaldiRecognizer
+except ImportError: logging.debug("Import attempt failed for: vosk")
+
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+    GOOGLE_DRIVE_ENABLED = True; SCOPES = ['https://www.googleapis.com/auth/drive']
+    logging.debug("Successfully imported Google Drive libraries.")
+except ImportError: logging.debug("Import attempt failed for Google Drive libraries.")
+
+try: from pyannote.audio import Pipeline
+except ImportError: logging.debug("Import attempt failed for: pyannote.audio")
+except Exception as e: logging.debug(f"pyannote.audio import generated error: {e}")
+
+# Typing Imports
+from typing import List, Dict, Callable, Any, Optional, Tuple, Union
+
+# --- Suppress Warnings ---
+warnings.filterwarnings("ignore",category=FutureWarning); warnings.filterwarnings("ignore",category=UserWarning)
+logging.getLogger("speechbrain").setLevel(logging.ERROR); logging.getLogger("pyannote").setLevel(logging.WARNING)
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
+
+# --- ANSI Escape Codes ---
+SAVE_CURSOR="\x1b[s"; RESTORE_CURSOR="\x1b[u"; CLEAR_LINE_END="\x1b[K"
+
+# --- Global Configuration & State ---
+_running = True; CALLBACK_INTERVAL = 0.05; STATS_FETCH_INTERVAL_SEC = 1.0
+
+# --- State Variables ---
+_last_net_io_counters: Optional[psutil._common.snetio]=None; _last_net_io_time: Optional[float]=None
+net_speed_down: float=0.0; net_speed_up: float=0.0; net_speed: float=0.0
+_last_target_col_l1: int=1; _last_target_col_l2: int=1; _last_target_col_l3: int=1
+_latest_stats: Optional[Dict[str, Any]]=None; _current_video_file: Optional[str]=None
+_current_video_url: Optional[str]=None; _current_status_msg: str="Idle"
+_current_progress: float=0.0; _current_speaker_info: str=""
+
+# --- Configuration Paths and Files ---
+VOSK_DIR=os.path.expanduser("~/vosk/"); TRANSCRIPTIONS_DIR_LOCAL="./transcriptions"
+TRANSCRIPTIONS_DIR_GDRIVE="gdrive"; CONFIG_FILE="vosk_config.json"
+CREDENTIALS_DIR=os.path.expanduser("~/credentials"); HF_TOKEN_PATH=os.path.join(CREDENTIALS_DIR,"hugface_pyannote.audio","hf_token")
+DEFAULT_GDRIVE_KEY_PATH=os.path.join(CREDENTIALS_DIR,"google_drive","service_account.json")
+TEMP_DIR="./temp"; LOCAL_REGISTRY_DB_FILE="transcript_registry.db"
+
+# --- Environment & Global Vars ---
+os.environ["OPENBLAS_NUM_THREADS"]="2"; download_in_progress=False; max_threads=1
+vosk_model_path: Optional[str]=None; hf_token: Optional[str]=None
+resource_monitor_max_threads=1; gdrive_service: Optional[Any]=None
+
+# --- Instance Lock ---
+_lock_file_path: Optional[str]=None; _lock_file_descriptor: Optional[int]=None
+
+# --- Resource Data ---
+resource_data={"cpu_percent_total":0.0,"cpu_percents_list":[],"ram_used":0,"ram_total":0,"ram_percent":0.0,"swap_used":0,"swap_total":0,"swap_percent":0.0,"gpu_info_str":"N/A","threads_active":0,"threads_available":os.cpu_count() or 1,"net_down_calculated":0.0,"net_up_calculated":0.0,"last_updated":0.0}
+monitor_resources_flag = False
+
+# =======================================================================
+# === File Locking Context Manager (Helper for Local Shim) =============
+# =======================================================================
+@contextlib.contextmanager
+def file_lock(lock_file_path, mode='r+'):
+    """Context manager for acquiring an exclusive lock on a local file."""
+    f = None; lock_acquired = False
+    try:
+        open_mode = mode.replace('b','') + ('b' if IS_WINDOWS else '')
+        os.makedirs(os.path.dirname(lock_file_path), exist_ok=True)
+        final_mode = open_mode if '+' in open_mode else open_mode.replace(open_mode[0], 'a') + ('+' if '+' not in open_mode else '')
+        f = open(lock_file_path, final_mode )
+    except OSError as e: logging.error(f"Local lock shim: Cannot open {lock_file_path}:{e}"); raise
+    try:
+        if IS_LINUX: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB); lock_acquired = True
+        elif IS_WINDOWS: f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1); lock_acquired = True
+        f.seek(0); yield f
+    except (IOError, BlockingIOError) as e: logging.debug(f"Local lock shim: Lock busy {lock_file_path}({e})."); raise
+    except Exception as e: logging.error(f"Local lock shim: Error lock {lock_file_path}:{e}"); raise
+    finally:
+        if lock_acquired:
+            try:
+                if IS_LINUX: fcntl.flock(f, fcntl.LOCK_UN)
+                elif IS_WINDOWS: f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception as e_unlck: logging.error(f"Local lock shim: Err unlock {lock_file_path}:{e_unlck}")
+        if f: f.close()
+
+# =======================================================================
+# === Instance Locking Mechanism (Task Specific) ========================
+# =======================================================================
+def acquire_instance_lock(source_arg: str, output_dir_arg: Optional[str]) -> bool:
+    """Acquires lock based on resolved source and output args."""
+    global _lock_file_path, _lock_file_descriptor
+    # --- OUTER TRY ---
+    try:
+        # Resolve paths and determine lock file name
+        res_src=source_arg; p_path=os.path.abspath(os.path.expanduser(source_arg));
+        if os.path.exists(p_path): res_src=p_path
+        is_gdrive=(res_src.startswith(TRANSCRIPTIONS_DIR_GDRIVE+":"))
+        res_out=output_dir_arg or (TRANSCRIPTIONS_DIR_GDRIVE if is_gdrive else TRANSCRIPTIONS_DIR_LOCAL)
+        if not res_out.startswith(TRANSCRIPTIONS_DIR_GDRIVE): res_out=os.path.abspath(os.path.expanduser(res_out))
+        lock_id=f"{res_src}|{res_out}"; task_hash=hashlib.md5(lock_id.encode()).hexdigest()
+        lock_fname=f".transcriber_task_{task_hash}.lock"; _lock_file_path=os.path.expanduser(os.path.join("~",lock_fname))
+        logging.debug(f"Lock ID:'{lock_id}' -> File:{_lock_file_path}")
+
+        # Open file descriptor
+        mode=os.O_CREAT|os.O_WRONLY
+        try:
+            lock_dir = os.path.dirname(_lock_file_path)
+            if not os.path.exists(lock_dir):
+                 try: os.makedirs(lock_dir, exist_ok=True)
+                 except OSError as mkdir_e: logging.warning(f"Could not create dir for lock file {lock_dir}: {mkdir_e}") # Non-fatal usually
+            _lock_file_descriptor=os.open(_lock_file_path, mode, 0o644)
+        except OSError as e:
+            logging.error(f"Cannot open lock file '{_lock_file_path}':{e}")
+            _lock_file_path = f"ErrOpen:{e}" # Store path error
+            return False
+
+        # Attempt to acquire lock
+        lock_fail_msg=None
+        if IS_LINUX:
+            try:
+                fcntl.lockf(_lock_file_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except IOError as e:
+                # Use errno module if available for better readability
+                import errno
+                if e.errno in [errno.EAGAIN, errno.EWOULDBLOCK, 11, 35]:
+                    lock_fail_msg=f"fcntl lock failed (errno {e.errno})"
+                else:
+                    lock_fail_msg=f"fcntl lock unexpected IOError: {e}"
+            except Exception as e:
+                 lock_fail_msg = f"fcntl lock unexpected error: {e}"
+        elif IS_WINDOWS:
+            try:
+                msvcrt.locking(_lock_file_descriptor, msvcrt.LK_NBLCK, 1)
+            except IOError as e:
+                lock_fail_msg=f"msvcrt lock failed: {e}"
+            except Exception as e:
+                lock_fail_msg=f"msvcrt lock unexpected error: {e}"
+
+        # Handle lock failure
+        if lock_fail_msg:
+            logging.warning(f"{lock_fail_msg}. Task running?")
+            try:
+                os.close(_lock_file_descriptor) # Close descriptor if lock failed
+            except OSError as close_e:
+                 logging.error(f"Error closing fd after lock fail for {_lock_file_path}: {close_e}")
+            _lock_file_descriptor=None
+            return False
+
+        # --- Write PID (Corrected Structure) ---
+        try:
+            os.ftruncate(_lock_file_descriptor, 0)
+            os.lseek(_lock_file_descriptor, 0, os.SEEK_SET)
+            os.write(_lock_file_descriptor, str(os.getpid()).encode())
+        except OSError as e:
+            logging.warning(f"Cannot write PID to lock {_lock_file_path}:{e}")
+        # --- End Write PID block ---
+
+        atexit.register(release_instance_lock)
+        return True
+
+    # --- OUTER EXCEPT ---
+    except Exception as e:
+        logging.error(f"Lock acquire error:{e}")
+        _lock_file_path = f"ErrAcq:{e}" # Store path error info
+        if _lock_file_descriptor is not None:
+            try:
+                os.close(_lock_file_descriptor)
+            except OSError:
+                pass
+            _lock_file_descriptor = None
+    return False # Failed
+
+      
+def release_instance_lock():
+    """Releases the instance lock by closing the file descriptor."""
+    global _lock_file_descriptor, _lock_file_path
+    # Check if there is a descriptor to release
+    if _lock_file_descriptor is not None:
+        # Capture values before clearing globals to prevent potential re-entry issues
+        fd_to_close = _lock_file_descriptor
+        path_locked = _lock_file_path
+        _lock_file_descriptor = None # Mark as released early
+
+        logging.info(f"Releasing instance lock: {path_locked}")
+        try:
+            # Attempt to close the file descriptor
+            os.close(fd_to_close)
+        except OSError as e:
+            # Log if closing the descriptor itself fails
+            logging.error(f"Error closing lock file descriptor for {path_locked}: {e}")
+        # Optional file removal logic could go here if desired, within the 'if' block
+        # try:
+        #     if path_locked and os.path.exists(path_locked): os.remove(path_locked)
+        # except OSError as e: logging.warning(f"Could not remove lock file {path_locked}: {e}")
+
+    
+# =======================================================================
+# === Timer System ======================================================
+# =======================================================================
+@dataclass
+class TimerEntry: enable: bool=False; count: int=20; countdown: int=1; function: Callable=None; run_once: bool=False
+_timers: Dict[str, TimerEntry] = {}
+def add_timer(timer_id: str, func: Callable, interval_sec: float, enabled: bool=True, run_once: bool=False):
+    global _timers, CALLBACK_INTERVAL;
+    if not callable(func): logging.error(f"Timer '{timer_id}': Not callable."); return
+    if interval_sec<=0 and not run_once: logging.error(f"Timer '{timer_id}': Interval must be positive."); return
+    count=0 if run_once else max(1, round(interval_sec / CALLBACK_INTERVAL))
+    _timers[timer_id]=TimerEntry(enable=enabled, count=count, countdown=1, function=func, run_once=run_once)
+    logging.debug(f"Timer '{timer_id}' added: Intvl ~{interval_sec}s, Cnt:{count}, En:{enabled}, Once:{run_once}")
+def enable_timer(timer_id: str, enabled: bool=True):
+    if timer_id in _timers: _timers[timer_id].enable=enabled; logging.debug(f"Timer '{timer_id}' set en={enabled}")
+    else: logging.warning(f"Timer '{timer_id}' not found.")
+async def _run_timer_tick():
+    global _timers;
+    for tid, timer in list(_timers.items()):
+        if not timer.enable and timer.countdown<=1: continue
+        original_countdown = timer.countdown; reload_count = timer.count
+        if original_countdown > 0: timer.countdown -= 1
+        execute_this_tick = timer.enable and timer.countdown == 0
+        if execute_this_tick:
+            func_success = False
+            try:
+                logging.debug(f"Executing timer '{tid}'...")
+                result = timer.function();
+                if asyncio.iscoroutine(result): await result
+                logging.debug(f"Timer '{tid}' executed successfully.")
+                func_success = True
+            except Exception as e:
+                func_name = timer.function.__name__ if hasattr(timer.function, '__name__') else 'unknown_function'
+                logging.error(f"Error executing timer '{tid}' ({func_name}): {repr(e)}")
+            # --- Timer Reload/Disable Logic ---
+            if timer.run_once: timer.enable = False; logging.debug(f"Timer '{tid}' disabled after single run.")
+            elif reload_count > 0: timer.countdown = reload_count
+            else: timer.enable = False
+        elif not timer.enable and original_countdown == 1 and reload_count > 0 and not timer.run_once: timer.countdown = reload_count
+
+# =======================================================================
+# === Resource Fetching =================================================
+# =======================================================================
+def resource_fetch():
+    global resource_data, net_speed_down, net_speed_up, _last_net_io_counters, _last_net_io_time
+    try:
+        r=resource_data; p=psutil;
+        if p: # Check if psutil imported successfully
+             r["cpu_percent_total"]=p.cpu_percent(None); r["cpu_percents_list"]=p.cpu_percent(None, True)
+             m=p.virtual_memory(); r["ram_used"]=m.used; r["ram_total"]=m.total; r["ram_percent"]=m.percent
+             s=p.swap_memory(); r["swap_used"]=s.used; r["swap_total"]=s.total; r["swap_percent"]=s.percent
+             r["threads_available"] = os.cpu_count() or 1 # Update this dynamically? Or just at start? Let's keep it dynamic.
+        else: # Fallback if psutil missing
+             r["cpu_percent_total"]=0.0; r["cpu_percents_list"]=[]; r["ram_used"]=0; r["ram_total"]=0; r["ram_percent"]=0.0; r["swap_used"]=0; r["swap_total"]=0; r["swap_percent"]=0.0
+        r["threads_active"]=threading.active_count(); gpu_str="N/A" # Threads always available
+        if torch and torch.cuda.is_available(): # Check torch availability
+            try: n=torch.cuda.get_device_name(0); a=torch.cuda.memory_allocated(0); t=torch.cuda.get_device_properties(0).total_memory; gpu_str=f"{n}: {format_bytes_display(a)}/{format_bytes_display(t)}"
+            except Exception as e: gpu_str="GPU: Error"
+        r["gpu_info_str"]=gpu_str; ct=time.monotonic(); cc=p.net_io_counters() if p else None; ns_d=0.0; ns_u=0.0 # Network needs psutil
+        if cc and _last_net_io_counters and _last_net_io_time:
+            td=ct-_last_net_io_time;
+            if td>0: brd=cc.bytes_recv-_last_net_io_counters.bytes_recv; bsd=cc.bytes_sent-_last_net_io_counters.bytes_sent; ns_d=max(0,brd/td); ns_u=max(0,bsd/td)
+        r["net_down_calculated"]=ns_d; r["net_up_calculated"]=ns_u; _last_net_io_counters=cc; _last_net_io_time=ct; r["last_updated"]=time.time()
+    except Exception as e: logging.error(f"Resource fetch error: {repr(e)}")
+
+# =======================================================================
+# === Stats Display =====================================================
+# =======================================================================
+def format_bytes_display(num_bytes: float, precision: int=1) -> str:
+    if num_bytes==0: return "0 B"; u=['B','KB','MB','GB','TB']; p=0; v=float(num_bytes)
+    while v>=1024 and p+1<len(u): v/=1024; p+=1
+    return f"{v:.{precision}f} {u[p]}"
+
+def update_stats_display():
+    """Displays the most recent stats (no highlighting)."""
+    global _last_target_col_l1, _last_target_col_l2, _last_target_col_l3, resource_data, _current_video_url, _current_status_msg, _current_progress, _current_speaker_info, max_threads
+    if not sys.stdout.isatty() or resource_data["last_updated"]==0: return
+    try:
+        r=resource_data; cpus=r.get('cpu_percents_list',[]); cpu_s=" ".join(f"{p:.0f}" for p in cpus); cpu=f"CPU:[{cpu_s}]%"; gpu=f"GPU:{r.get('gpu_info_str','N/A')}"; l1=f"{cpu} | {gpu}"
+        thr=f"Thr:{r.get('threads_active','?')}/{r.get('threads_available','?')} (Max:{max_threads})"; mem=f"Mem:{format_bytes_display(r.get('ram_used',0),1)}/{format_bytes_display(r.get('ram_total',0),1)} ({r.get('ram_percent',0):.0f}%)"; swp=f"Swp:{format_bytes_display(r.get('swap_used',0),0)}/{format_bytes_display(r.get('swap_total',0),0)} ({r.get('swap_percent',0):.0f}%)"
+        if download_in_progress and net_speed>0: net=f"Net:↓{format_bytes_display(net_speed,1)}/s"
+        else: net=f"Net:↓{format_bytes_display(r.get('net_down_calculated',0),0)} ↑{format_bytes_display(r.get('net_up_calculated',0),0)}"
+        l2=f"{thr} | {mem} | {swp} | {net}"
+        src=_current_video_file or _current_video_url or "Idle"; max_src=35;
+        if len(src)>max_src: src="..."+src[-(max_src-3):]
+        bw=10; fw=int(_current_progress*bw); bar=f"[{'#'*fw}{'-'*(bw-fw)}]"; prog=f"{_current_progress:.1%}"; l3=f"Src: {src} | Status: {_current_status_msg} {bar} {prog} {_current_speaker_info}"
+        cols,rows=shutil.get_terminal_size(fallback=(80,24)); r1=max(1,rows-2); r2=max(1,rows-1); r3=rows; c1=max(1,cols-len(l1)+1); c2=max(1,cols-len(l2)+1); c3=1
+
+        # --- Corrected Truncation ---
+        if len(l1) > cols:
+            l1 = l1[:cols-1] + "…"
+        if len(l2) > cols:
+            l2 = l2[:cols-1] + "…"
+        if len(l3) > cols:
+            l3 = l3[:cols-1] + "…"
+        # --- End Correction ---
+
+        # Output with Padding
+        out=SAVE_CURSOR; p1=max(0,c1-_last_target_col_l1) if _last_target_col_l1<c1 else 0; out+=f"\x1b[{r1};{_last_target_col_l1}H{' '*p1}"; out+=f"\x1b[{r1};{c1}H{l1}{CLEAR_LINE_END}"
+        p2=max(0,c2-_last_target_col_l2) if _last_target_col_l2<c2 else 0; out+=f"\x1b[{r2};{_last_target_col_l2}H{' '*p2}"; out+=f"\x1b[{r2};{c2}H{l2}{CLEAR_LINE_END}"
+        out+=f"\x1b[{r3};{c3}H{l3}{CLEAR_LINE_END}"; out+=RESTORE_CURSOR;
+        sys.stdout.write(out); sys.stdout.flush();
+        _last_target_col_l1=c1; _last_target_col_l2=c2; _last_target_col_l3=c3
+
+    except Exception as e:
+        logging.error(f"Display error: {repr(e)}")
+        try:
+            sys.stdout.write(RESTORE_CURSOR); sys.stdout.flush()
+        except Exception as ce:
+             logging.debug(f"Cursor restore err:{ce}")
+
+# =======================================================================
+# === Core Async Callback Runner ========================================
+# =======================================================================
+async def run_callbacks():
+    global _running, array_local; is_tty=sys.stdout.isatty();
+    if not is_tty: logging.warning("Not TTY, stats display disabled.")
+    if psutil: psutil.cpu_percent(None, True); # Prime if available
+    resource_fetch(); await asyncio.sleep(0.1); resource_fetch()
+    while _running:
+        st=asyncio.get_event_loop().time();
+        try:
+            await _run_timer_tick();
+            if is_tty:
+                for item in array_local:
+                    if item.get('enable', False):
+                        try: item['function']()
+                        except Exception as e: logging.error(f"Local cb err '{item.get('function','?').__name__}': {repr(e)}")
+            el=asyncio.get_event_loop().time()-st; await asyncio.sleep(max(0, CALLBACK_INTERVAL-el))
+        except asyncio.CancelledError: _running=False; logging.info("Callbacks cancelled."); break
+        except Exception as e: logging.critical(f"Callback loop critical error: {repr(e)}"); traceback.print_exc(); await asyncio.sleep(5)
+
+# =======================================================================
+# === Signal Handling ===================================================
+# =======================================================================
+def handle_exit_signals(signum, frame):
+    global _running; logging.warning(f"Signal {signum}, shutdown..."); print(f"\nSignal {signum}, shutdown...", file=sys.stderr); _running = False
+
+# =======================================================================
+# === Dependency Checking and Configuration ============================
+# =======================================================================
+def check_core_dependencies():
+    """Checks core + unconditional third-party libs and tools."""
+    global Pipeline
+    missing=[]; modules={"psutil":psutil, "torch":torch, "yt_dlp":yt_dlp, "vosk":Model, "sqlite3":sqlite3}
+    # Platform specifics
+    if IS_WINDOWS:
+        try: __import__('msvcrt')
+        except ImportError: missing.append("msvcrt(req Win, std)")
+        try: __import__('colorama')
+        except ImportError: missing.append("colorama(opt Win)")
+    elif IS_LINUX:
+        try: __import__('fcntl')
+        except ImportError: missing.append("fcntl(req Lin, std)")
+
+    for name, mod_or_class in modules.items():
+        if mod_or_class is None: logging.error(f"Dep MISSING: {name}"); missing.append(name)
+        else: logging.debug(f"Dep OK: {name}")
+
+    # Check Pyannote (optional)
+    try: from pyannote.audio import Pipeline as PP; Pipeline = PP; logging.debug("Dep OK: pyannote")
+    except ImportError: logging.warning("Dep Optional: pyannote.audio MISSING")
+    except Exception as e: logging.warning(f"Dep Optional: pyannote.audio import error: {e}")
+
+    # Check ffmpeg (required)
+    try: subprocess.run(["ffmpeg","-version"],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE, text=True); logging.debug("Dep OK: ffmpeg")
+    except: logging.error("Dep MISSING: ffmpeg (required)"); missing.append("ffmpeg")
+
+    required_missing = [m for m in missing if not m.startswith("colorama") and not m.startswith("pyannote")]
+    if required_missing:
+        logging.critical("Core dependencies missing:\n"+"\n".join(f" - {m}" for m in required_missing)+"\nPlease install required packages.")
+        return False
+    logging.info("Core dependency check passed.")
+    return True
+# ... (check_resources_initial, load_vosk_config, save_config - No Changes) ...
+# ... (load_hf_token_if_needed - No Changes) ...
+def check_resources_initial():
+    """Checks system resources on startup."""
+    # Check if psutil and torch were successfully imported earlier
+    psutil_available = 'psutil' in sys.modules and psutil is not None
+    torch_available = 'torch' in sys.modules and torch is not None
+
+    r = {
+        "cores": psutil.cpu_count(logical=True) if psutil_available else 1,
+        "ram_gb": psutil.virtual_memory().total / (1024**3) if psutil_available else 0,
+        "swap_gb": psutil.swap_memory().total / (1024**3) if psutil_available else 0,
+        # Determine GPU availability based on successful torch import AND cuda check
+        "gpu_available": torch_available and torch.cuda.is_available(),
+        "gpu_name": None,
+        "gpu_memory_gb": None
+    }
+
+    # If GPU is potentially available, try getting details
+    if r["gpu_available"]:
+        # --- Corrected Try/Except Block ---
+        try:
+            r["gpu_name"] = torch.cuda.get_device_name(0)
+            r["gpu_memory_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        except Exception as e:
+            # If getting details fails, mark GPU as unavailable for this run
+            logging.warning(f"GPU check: CUDA available but failed to get details: {e}")
+            r["gpu_available"] = False
+            r["gpu_name"] = "Error Fetching Details"
+            r["gpu_memory_gb"] = None
+        # --- End Corrected Block ---
+
+    # Log final determined resources
+    logging.info(f"System: Cores={r['cores']}, RAM={r['ram_gb']:.2f}GB, Swap={r['swap_gb']:.2f}GB, GPU={'Yes' if r['gpu_available'] else 'No'}")
+    if r['gpu_available']:
+        logging.info(f" GPU: {r['gpu_name']}, Mem={r['gpu_memory_gb']:.2f}GB")
+
+    return r
+
+def load_vosk_config(ram_gb: float) -> dict:
+    """Loads configuration, determines model path and max threads."""
+    global max_threads, vosk_model_path
+    cfg = {}
+    def_model = "vosk-model-en-us-0.22" # Default model name
+    # Initialize globals to ensure they have a default value if config fails badly
+    max_threads = 1
+    vosk_model_path = None
+
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding='utf-8') as f: cfg = json.load(f)
+            logging.info(f"Loaded config: {CONFIG_FILE}")
+            mt = cfg.get("max_threads", 1); vp = cfg.get("model_path")
+            # Validate max_threads
+            if isinstance(mt, int) and mt >= 1: max_threads = mt
+            else: logging.warning(f"Invalid max_threads '{mt}', using default 1 for now."); max_threads = 1 # Keep default
+            # Validate model_path (just check if it's a non-empty string for now)
+            if isinstance(vp, str) and vp: vosk_model_path = vp
+            else: logging.warning(f"Invalid or missing model path '{vp}' in config."); vosk_model_path = None
+        except json.JSONDecodeError as e: logging.error(f"JSON decode err {CONFIG_FILE}: {e}. Defaults."); cfg={}; max_threads=1; vosk_model_path=None
+        except Exception as e: logging.error(f"Config load err ({CONFIG_FILE}): {e}. Defaults."); cfg={}; max_threads=1; vosk_model_path=None
+
+    # --- Default Logic (if config load failed or values invalid) ---
+    needs_default_threads = max_threads < 1
+    needs_default_path = not vosk_model_path or not os.path.isdir(vosk_model_path)
+
+    if needs_default_threads or needs_default_path:
+        logging.info("Determining default config values...")
+        cores = (psutil.cpu_count(logical=True) if psutil else 1) or 1
+
+        # --- Corrected If/Elif/Else for Default Threads ---
+        if needs_default_threads:
+            default_threads = 1 # Start with base default
+            if ram_gb < 4:
+                default_threads = 1
+            elif ram_gb < 8:
+                default_threads = min(2, cores)
+            elif ram_gb < 16:
+                default_threads = min(max(1, cores // 2), 4) # Heuristic
+            else: # 16GB+ RAM
+                default_threads = min(cores, 8) # Cap at 8 default
+            logging.info(f"Calculated default max_threads: {default_threads}")
+            max_threads = default_threads
+        # --- End Corrected Block ---
+
+        if needs_default_path:
+            logging.info("Attempting to find default model path...")
+            def_path=os.path.join(VOSK_DIR,def_model);
+            if os.path.isdir(def_path): vosk_model_path=def_path; logging.info(f"Using default model path: {vosk_model_path}")
+            else:
+                logging.warning(f"Default model '{def_model}' not in {VOSK_DIR}. Searching...");
+                try: poss=[d for d in os.listdir(VOSK_DIR) if d.startswith("vosk-model-en-us") and os.path.isdir(os.path.join(VOSK_DIR,d))]; vosk_model_path=os.path.join(VOSK_DIR,poss[0]) if poss else None;
+                except FileNotFoundError: logging.error(f"Vosk directory '{VOSK_DIR}' not found.")
+                except Exception as e: logging.error(f"Error searching Vosk dir {VOSK_DIR}: {e}")
+                if vosk_model_path: logging.info(f"Using fallback model path: {vosk_model_path}")
+                else: logging.error(f"No vosk model found in {VOSK_DIR}.") # vosk_model_path remains None
+
+        # Update config dict with defaults (even if only one needed updating) and save
+        cfg["model_path"] = vosk_model_path
+        cfg["max_threads"] = max_threads
+        if "last_model" not in cfg: cfg["last_model"] = None # Ensure last_model key exists
+        save_config(cfg)
+
+    # --- Final Validation ---
+    if not vosk_model_path or not os.path.isdir(vosk_model_path): logging.critical(f"Vosk model path invalid:'{vosk_model_path}'."); sys.exit(1)
+    check_file=os.path.join(vosk_model_path,"am","final.mdl");
+    if not os.path.exists(check_file): logging.critical(f"Vosk model '{vosk_model_path}' incomplete (missing {check_file})."); sys.exit(1)
+    logging.info(f"Using Vosk model: {vosk_model_path}"); logging.info(f"Max threads: {max_threads}"); return cfg
+
+def save_config(config: dict):
+    try:
+        config_dir=os.path.dirname(CONFIG_FILE);
+        if config_dir and not os.path.exists(config_dir): os.makedirs(config_dir, exist_ok=True)
+        with open(CONFIG_FILE,"w", encoding='utf-8') as f: json.dump(config,f,indent=4,sort_keys=True)
+        logging.info(f"Config saved:{CONFIG_FILE}")
+    except OSError as e: logging.error(f"Config save OS error {CONFIG_FILE}:{e}")
+    except TypeError as e: logging.error(f"Config save type error {CONFIG_FILE}:{e}")
+    except Exception as e: logging.error(f"Config save failed {CONFIG_FILE}:{e}")
+
+      
+def load_hf_token_if_needed() -> Optional[str]:
+    """Loads the HuggingFace token if Pyannote is available and token not already loaded."""
+    global hf_token
+
+    # --- Corrected Initial Checks ---
+    # 1. Check if Pyannote library is available
+    if Pipeline is None:
+        logging.debug("Pyannote unavailable, skip HF token load.")
+        return None
+
+    # 2. Check if token is already loaded (cached in global var)
+    if hf_token:
+        logging.debug("HF token already loaded.")
+        return hf_token
+    # --- End Corrected Initial Checks ---
+
+    # Proceed to load from file only if necessary
+    logging.info(f"Attempting load HF token: {HF_TOKEN_PATH}")
+    try:
+        # Ensure parent directory exists
+        hf_creds_dir = os.path.dirname(HF_TOKEN_PATH)
+        if not os.path.exists(hf_creds_dir):
+            try: os.makedirs(hf_creds_dir, exist_ok=True); logging.info(f"Created HF dir:{hf_creds_dir}")
+            except OSError as e: logging.error(f"Cannot create HF dir {hf_creds_dir}:{e}")
+
+        # Check if file exists
+        if not os.path.exists(HF_TOKEN_PATH):
+            logging.error(f"HF token file missing: {HF_TOKEN_PATH}. Please create it.")
+            return None
+
+        # Read token
+        with open(HF_TOKEN_PATH,"r", encoding='utf-8') as f: tk=f.read().strip();
+        if not tk:
+            logging.error(f"HF token file empty: {HF_TOKEN_PATH}"); return None
+
+        # Store and return
+        hf_token=tk; logging.info("HF token loaded successfully.")
+        return tk
+
+    except Exception as e:
+        logging.error(f"HF token load error ({HF_TOKEN_PATH}): {e}")
+        return None
+
+    
+# =======================================================================
+# === Helper Functions (Filename Slugs, Timeout, Checksum) ==============
+# =======================================================================
+# ... (create_channel_slug, create_title_slug, timeout_handler, calculate_sha256 - No Changes) ...
+def create_channel_slug(channel: str) -> str:
+    if not channel: return "UnknownChannel"; s=re.sub(r'[^a-zA-Z0-9]','',channel)[:20]; r=s.strip('-'); return r if r else "UnknownChannel"
+def create_title_slug(title: str) -> str:
+    if not title: return "Untitled"; s=re.sub(r'[^a-zA-Z0-9 ]','',title).replace(" ","-")[:30]; r=s.strip('-'); return r if r else "Untitled"
+def timeout_handler(signum, frame): logging.warning("Timeout."); raise TimeoutError("Timeout")
+
+      
+def calculate_sha256(file_path: str) -> Optional[str]:
+    """Calculates the SHA256 hash of a file."""
+    # Check if path is valid file before opening
+    if not os.path.isfile(file_path):
+        logging.error(f"Checksum failed: Not a file - '{file_path}'")
+        return None
+
+    sha = hashlib.sha256() # Initialize hash object
+    try:
+        with open(file_path, "rb") as f:
+            # --- Corrected Loop ---
+            while True:
+                chunk = f.read(8192) # Read in chunks
+                if not chunk:
+                    break # End of file reached
+                # Update hash with the chunk
+                sha.update(chunk)
+            # --- End Corrected Loop ---
+        # Return the hexadecimal representation of the hash
+        return sha.hexdigest()
+    except OSError as e:
+        # Handle errors during file reading
+        logging.error(f"Checksum calculation OS error for '{file_path}': {e}")
+        return None
+    except Exception as e:
+        # Handle any other unexpected errors
+        logging.error(f"Checksum calculation unexpected error for '{file_path}': {e}")
+        return None
+
+# =======================================================================
+# === Google Drive/Local File Shim/Dispatch Functions ===================
+# =======================================================================
+# ... (initialize_gdrive_service, _execute_gdrive_request - No Changes) ...
+# ... (local_* file functions - No Changes) ...
+# ... (is_gdrive_path, read_fifo_lines, append_fifo_line, modify_fifo_line) ...
+# ... (delete_fifo_line, upload_final_transcript - No Changes) ...
+async def initialize_gdrive_service(key_file_path: str):
+    global gdrive_service
+    if not GOOGLE_DRIVE_ENABLED: logging.error("GDrive libs missing."); return False
+    if gdrive_service: return True
+    resolved_path = os.path.abspath(os.path.expanduser(key_file_path))
+    logging.info(f"Load GDrive creds: {resolved_path}")
+    if not os.path.exists(resolved_path): logging.error(f"Service Account key not found: {resolved_path}"); return False
+    try: creds = service_account.Credentials.from_service_account_file(resolved_path, scopes=SCOPES); gdrive_service = build('drive', 'v3', credentials=creds, cache_discovery=False); logging.info("GDrive API OK."); return True
+    except HttpError as error: logging.error(f"GDrive build err:{error}")
+    except Exception as e: logging.error(f"GDrive creds/build fail:{e}")
+    gdrive_service = None; return False
+
+async def _execute_gdrive_request(request):
+    """Helper to run blocking GDrive API calls in executor."""
+    loop = asyncio.get_running_loop()
+    try:
+        # Using default executor (usually ThreadPoolExecutor)
+        result = await loop.run_in_executor(None, request.execute)
+        return result
+    except HttpError as error:
+        # Log the main error
+        logging.error(f"GDrive API error: {error}")
+
+        # --- Corrected Inner Try/Except for Details ---
+        try:
+            # Attempt to parse and log JSON details from the error content
+            # error.content is typically bytes, needs decoding
+            error_details = json.loads(error.content.decode('utf-8')).get('error', {})
+            message = error_details.get('message', 'No message detail')
+            code = error_details.get('code', 'N/A')
+            logging.error(f"  Reason: {message} (Code: {code})")
+        except (json.JSONDecodeError, AttributeError, UnicodeDecodeError, Exception) as detail_err:
+            # Ignore errors during detail parsing/logging
+            logging.debug(f"Could not parse detailed GDrive error reason: {detail_err}")
+            # pass - The main error is already logged above
+        # --- End Corrected Inner Try/Except ---
+
+        return None # Indicate failure by returning None
+
+    except Exception as e:
+        # Catch other unexpected errors during execution
+        logging.error(f"GDrive request unexpected error: {repr(e)}")
+        traceback.print_exc() # Log traceback for unexpected errors
+        return None
+
+async def local_read_lines(file_path: str, num_lines: int = 1, skip_lines: int = 0) -> Optional[List[str]]:
+    logging.debug(f"Local read lines {skip_lines}-{skip_lines+num_lines-1} from {file_path}")
+    abs_path = os.path.abspath(os.path.expanduser(file_path))
+    try:
+        with file_lock(abs_path, 'r') as f: lines = f.readlines(); lines = [line.rstrip('\n\r') for line in lines]; return lines[skip_lines : skip_lines + num_lines]
+    except FileNotFoundError: logging.warning(f"Local read: File not found {abs_path}"); return []
+    except (IOError, BlockingIOError) as e: logging.warning(f"Local read lock failed for {abs_path}: {e}"); return None
+    except Exception as e: logging.error(f"Local read error {abs_path}: {e}"); return None
+async def local_write_content(file_path: str, content: str) -> bool:
+    logging.debug(f"Local overwriting file {file_path}")
+    abs_path = os.path.abspath(os.path.expanduser(file_path))
+    try:
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True);
+        with file_lock(abs_path, 'w') as f: f.truncate(0); f.write(content)
+        return True
+    except (IOError, BlockingIOError) as e: logging.warning(f"Local write lock failed for {abs_path}: {e}"); return False
+    except Exception as e: logging.error(f"Local write error {abs_path}: {e}"); return False
+async def local_append_line(file_path: str, line_to_append: str) -> bool:
+    logging.debug(f"Local appending to {file_path}")
+    abs_path = os.path.abspath(os.path.expanduser(file_path))
+    try:
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True);
+        with file_lock(abs_path, 'a') as f: f.write(line_to_append.strip() + '\n')
+        return True
+    except (IOError, BlockingIOError) as e: logging.warning(f"Local append lock failed for {abs_path}: {e}"); return False
+    except Exception as e: logging.error(f"Local append error {abs_path}: {e}"); return False
+async def local_modify_line(file_path: str, line_index: int, new_line_content: str) -> bool:
+     logging.debug(f"Local modifying line {line_index} in {file_path}")
+     abs_path = os.path.abspath(os.path.expanduser(file_path))
+     try:
+         with file_lock(abs_path, 'r+') as f:
+              lines = f.readlines(); lines = [line.rstrip('\n\r') for line in lines]
+              if line_index >= len(lines): logging.error(f"Local modify: Index {line_index} OOB"); return False
+              lines[line_index] = new_line_content.strip(); new_content = "\n".join(lines)
+              f.seek(0); f.truncate(0); f.write(new_content)
+         return True
+     except FileNotFoundError: logging.warning(f"Local modify: File not found {abs_path}"); return False
+     except (IOError, BlockingIOError) as e: logging.warning(f"Local modify lock/IO failed {abs_path}: {e}"); return False
+     except Exception as e: logging.error(f"Local modify error {abs_path}: {e}"); return False
+async def local_delete_line(file_path: str, line_index: int = 0) -> bool:
+    logging.debug(f"Local deleting line {line_index} from {file_path}")
+    abs_path = os.path.abspath(os.path.expanduser(file_path))
+    try:
+        with file_lock(abs_path, 'r+') as f:
+            lines = f.readlines(); lines = [line.rstrip('\n\r') for line in lines]
+            if line_index >= len(lines): logging.error(f"Local delete: Index {line_index} OOB"); return False
+            del lines[line_index]; new_content = "\n".join(lines)
+            f.seek(0); f.truncate(0); f.write(new_content)
+        return True
+    except FileNotFoundError: logging.warning(f"Local delete: File not found {abs_path}"); return True # OK if gone?
+    except (IOError, BlockingIOError) as e: logging.warning(f"Local delete lock/IO failed {abs_path}: {e}"); return False
+    except Exception as e: logging.error(f"Local delete error {abs_path}: {e}"); return False
+async def local_upload_file(local_path: str, target_folder_path: str, target_filename: str) -> Optional[str]:
+    logging.info(f"Local Upload: {local_path} -> {target_folder_path} as {target_filename}")
+    abs_folder=os.path.abspath(os.path.expanduser(target_folder_path)); dest=os.path.join(abs_folder, target_filename)
+    try: os.makedirs(abs_folder, exist_ok=True); shutil.copy2(local_path, dest); logging.info(f"Local copy OK: {dest}"); return dest
+    except Exception as e: logging.error(f"Local copy/upload failed: {e}"); return None
+
+# Helper function (ensure this is present somewhere before gdrive_read_lines is called)
+def _gdrive_download_chunks(downloader):
+    """Helper function to run downloader loop synchronously."""
+    done = False
+    status = None
+    while not done:
+        # next_chunk() is blocking, so this whole function runs synchronously when called via run_in_executor
+        try:
+            status, done = downloader.next_chunk()
+            if status:
+                 logging.debug(f"GDrive download progress: {int(status.progress() * 100)}%")
+        except HttpError as error:
+             logging.error(f"GDrive download chunk HttpError: {error}")
+             raise # Re-raise the error to be caught by the caller's executor handling
+        except Exception as e:
+             logging.error(f"GDrive download chunk unexpected error: {e}")
+             raise # Re-raise
+
+async def gdrive_read_lines(file_id: str, num_lines: int = 1, skip_lines: int = 0) -> Optional[List[str]]:
+    """Placeholder/Simulation: Reads lines from a GDrive file."""
+    # Log first, indicating potential simulation
+    logging.warning(f"GDrive Functionality: gdrive_read_lines({file_id}) - NOT FULLY IMPLEMENTED (Basic Simulation Only)")
+
+    # Check if service is initialized *before* proceeding
+    if not gdrive_service:
+        logging.error("GDrive service not ready (gdrive_read_lines).")
+        return None
+
+    # Proceed with simulation/placeholder logic
+    try:
+        logging.debug(f"GDrive Sim: Reading lines {skip_lines}-{skip_lines+num_lines-1} from {file_id}")
+        request = gdrive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        loop = asyncio.get_running_loop()
+
+        # Use run_in_executor for the potentially blocking _gdrive_download_chunks helper
+        await loop.run_in_executor(None, _gdrive_download_chunks, downloader)
+
+        # Process downloaded content
+        content = fh.getvalue().decode('utf-8')
+        lines = content.splitlines()
+        # Return the requested slice
+        return lines[skip_lines : skip_lines + num_lines]
+    except HttpError as error:
+         # Handle common errors like file not found (404)
+         if hasattr(error, 'resp') and error.resp.status == 404:
+              logging.warning(f"GDrive read sim: File not found {file_id}")
+              return [] # Return empty list for "not found"
+         else:
+              # Log other HttpErrors using the helper if possible
+              logging.error(f"GDrive read sim HttpError {file_id}: {error}")
+              try: logging.error(f" Reason:{json.loads(error.content.decode('utf-8')).get('error',{}).get('message','')}")
+              except: pass
+              return None
+    except Exception as e:
+        # Catch errors potentially raised by _gdrive_download_chunks or decoding
+        logging.error(f"GDrive read sim processing error {file_id}: {e}")
+        return None
+
+      
+async def gdrive_append_line(file_id: str, line_to_append: str) -> bool:
+    """Placeholder/Simulation: Appends a line by reading/overwriting (WARNING: RACE CONDITION)."""
+    logging.warning(f"GDrive Functionality: gdrive_append_line({file_id}) - NOT ROBUST (Simulating Read/Overwrite)")
+
+    # Check service first
+    if not gdrive_service:
+        logging.error("GDrive append: Service not ready.")
+        return False
+
+    # Read existing lines (limit read depth for safety)
+    # A large limit like 50000 might still be very slow/memory intensive
+    # Consider alternative strategies for large files in production
+    current_lines = await gdrive_read_lines(file_id, num_lines=50000)
+
+    # Check if read was successful (gdrive_read_lines returns None on error, [] on not found)
+    if current_lines is None:
+        logging.error(f"GDrive append: Failed to read existing content for {file_id}.")
+        return False # Read failed
+
+    # Append new line and construct new content
+    # Ensure the appended line doesn't add extra blank lines if input is empty
+    new_content_lines = current_lines + [line_to_append.strip()]
+    new_content = "\n".join(new_content_lines)
+
+    # Write the new content back (overwriting)
+    write_ok = await gdrive_write_content(file_id, new_content)
+    if not write_ok:
+        logging.error(f"GDrive append: Failed to write updated content for {file_id}.")
+        return False
+
+    # Optional: Add a short delay and re-read to *attempt* verification (still not foolproof)
+    await asyncio.sleep(1) # Wait a second for potential GDrive consistency
+    verify_lines = await gdrive_read_lines(file_id, num_lines=len(new_content_lines) + 5) # Read a bit extra
+    if verify_lines and verify_lines[-1].strip() == line_to_append.strip():
+         logging.debug(f"GDrive append verification: Last line matches for {file_id}.")
+         return True
+    elif verify_lines:
+         logging.warning(f"GDrive append verification FAILED: Last line mismatch for {file_id}. Expected '{line_to_append.strip()}', got '{verify_lines[-1].strip() if verify_lines else 'None'}'.")
+         return False # Treat verification failure as overall failure
+    else:
+         logging.warning(f"GDrive append verification FAILED: Could not re-read file {file_id}.")
+         return False # Treat verification failure as overall failure
+
+    
+      
+async def gdrive_write_content(file_id: str, content: str) -> bool:
+    """Placeholder/Simulation: Overwrites the entire content of a GDrive file."""
+    # Log first, indicating potential simulation
+    logging.warning(f"GDrive Functionality: gdrive_write_content({file_id}) - Placeholder/Simulation")
+
+    # Check if service is initialized *before* proceeding
+    if not gdrive_service:
+        logging.error("GDrive write: Service not ready.")
+        return False
+
+    # Log the action being taken
+    logging.debug(f"GDrive Sim: Overwriting file {file_id}")
+    try:
+        # Prepare the media object using BytesIO
+        media_content = io.BytesIO(content.encode('utf-8'))
+        media = MediaFileUpload(media_content, mimetype='text/plain', resumable=True)
+
+        # Execute the update request using the helper
+        result = await _execute_gdrive_request(
+            gdrive_service.files().update(fileId=file_id, media_body=media)
+        )
+
+        # Check if the helper returned a result (indicating no HTTP error)
+        if result is not None:
+            logging.debug(f"GDrive Sim: Write request executed for {file_id}.")
+            return True # Assume success if no exception from helper
+        else:
+            logging.error(f"GDrive Sim: Write request failed for {file_id} (see previous API error).")
+            return False
+
+    except Exception as e:
+        # Catch any other unexpected errors during media prep or request setup
+        logging.error(f"GDrive write sim unexpected error {file_id}: {e}")
+        return False
+
+      
+async def gdrive_modify_line(file_id: str, line_index: int, new_line_content: str) -> bool:
+     """Placeholder/Simulation: Modifies a specific line by reading/overwriting (WARNING: RACE CONDITION)."""
+     # Log first
+     logging.warning(f"GDrive Functionality: gdrive_modify_line({file_id}, {line_index}) - NOT ROBUST (Simulating Read/Overwrite)")
+
+     # Check service
+     if not gdrive_service:
+          logging.error("GDrive modify: Service not ready.")
+          return False
+
+     # Read existing lines
+     # Limit read depth for safety/performance in simulation
+     current_lines = await gdrive_read_lines(file_id, num_lines=50000)
+
+     # Validate read result and index
+     if current_lines is None:
+          logging.error(f"GDrive modify: Failed to read existing content for {file_id}.")
+          return False # Read failed
+     if not isinstance(line_index, int) or line_index < 0 or line_index >= len(current_lines):
+         logging.error(f"GDrive modify: Index {line_index} out of bounds for {file_id} (len {len(current_lines)})")
+         return False # Invalid index
+
+     # Modify the specific line in the list
+     try:
+          current_lines[line_index] = new_line_content.strip() # Ensure no extra whitespace
+     except IndexError:
+         # Should be caught by the check above, but for safety
+         logging.error(f"GDrive modify: IndexError for {line_index} despite check (len {len(current_lines)})")
+         return False
+
+
+     # Join lines and write back content
+     new_content = "\n".join(current_lines)
+     write_ok = await gdrive_write_content(file_id, new_content)
+     if not write_ok:
+         logging.error(f"GDrive modify: Failed to write updated content for {file_id}.")
+         return False
+
+     # Optional: Add verification step (read back and check) if needed, similar to append
+     logging.debug(f"GDrive modify simulation successful for line {line_index} in {file_id}.")
+     return True # Assume success if write didn't fail
+
+      
+async def gdrive_delete_line(file_id: str, line_index: int = 0) -> bool:
+    """Placeholder/Simulation: Deletes a specific line by reading/overwriting (WARNING: RACE CONDITION)."""
+    # Log first
+    logging.warning(f"GDrive Functionality: gdrive_delete_line({file_id}, {line_index}) - NOT ROBUST (Simulating Read/Overwrite)")
+
+    # Check service
+    if not gdrive_service:
+        logging.error("GDrive delete: Service not ready.")
+        return False
+
+    # Read existing lines
+    # Limit read depth for safety/performance in simulation
+    current_lines = await gdrive_read_lines(file_id, num_lines=50000)
+
+    # Validate read result and index
+    if current_lines is None:
+         logging.error(f"GDrive delete: Failed to read existing content for {file_id}.")
+         return False # Read failed
+    if not isinstance(line_index, int) or line_index < 0 or line_index >= len(current_lines):
+        # If index is out of bounds, the line effectively doesn't exist to be deleted.
+        # Consider this a success in terms of the end state? Or failure because index was bad?
+        # Let's log a warning and return True, assuming the goal is "ensure line X is not present".
+        logging.warning(f"GDrive delete: Index {line_index} out of bounds for {file_id} (len {len(current_lines)}). Line already effectively 'deleted' or index invalid.")
+        return True # Treat as success if line isn't there to delete
+
+    # Delete the specified line from the list
+    try:
+        del current_lines[line_index]
+        logging.debug(f"GDrive delete sim: Removed line at index {line_index}.")
+    except IndexError:
+         # Should be caught by the check above, but for safety
+         logging.error(f"GDrive delete: IndexError for {line_index} despite check (len {len(current_lines)})")
+         return False
+
+    # Join remaining lines and write back content
+    new_content = "\n".join(current_lines)
+    write_ok = await gdrive_write_content(file_id, new_content)
+    if not write_ok:
+        logging.error(f"GDrive delete: Failed to write updated content for {file_id}.")
+        return False
+
+    logging.debug(f"GDrive delete simulation successful for line {line_index} in {file_id}.")
+    return True # Assume success if write didn't fail
+
+      
+async def gdrive_upload_file(local_path: str, target_folder_id: str, target_filename: str) -> Optional[str]:
+    """Uploads a local file to a GDrive folder, returns new File ID."""
+    # Log the intent first
+    logging.info(f"GDrive Upload Call: '{local_path}' -> FolderID '{target_folder_id}' as '{target_filename}'")
+
+    # --- Corrected Initial Checks ---
+    # Check service
+    if not gdrive_service:
+        logging.error("GDrive upload: Service not ready.")
+        return None
+    # Check local file existence
+    if not os.path.isfile(local_path):
+        logging.error(f"GDrive upload: Local file not found - '{local_path}'")
+        return None
+    # --- End Initial Checks ---
+
+    try:
+        # Prepare metadata and media upload object
+        metadata = {'name': target_filename, 'parents': [target_folder_id]}
+        # Use appropriate mimetype if known, otherwise let API guess
+        # Example: mimetype = 'text/plain' or 'audio/mpeg' etc.
+        media = MediaFileUpload(local_path, resumable=True)
+
+        # Execute the create request using the helper
+        file = await _execute_gdrive_request(
+            gdrive_service.files().create(body=metadata, media_body=media, fields='id')
+        )
+
+        # Check result and return file ID
+        if file and file.get('id'):
+             file_id = file.get('id')
+             logging.info(f"GDrive upload OK. File ID: {file_id}")
+             return file_id
+        else:
+             # Error should have been logged by _execute_gdrive_request helper
+             logging.error("GDrive upload failed (API did not return ID or helper failed).")
+             return None
+
+    except Exception as e:
+        # Catch any other unexpected errors during upload process
+        logging.error(f"GDrive upload unexpected error for {target_filename}: {e}")
+        traceback.print_exc()
+        return None
+
+def is_gdrive_path(path_or_id: str) -> bool:
+    if not path_or_id: return False # Handle empty strings
+    # Treat as GDrive if starts with prefix OR if libs enabled and looks like an ID
+    return path_or_id.startswith(TRANSCRIPTIONS_DIR_GDRIVE + ":") or \
+           (GOOGLE_DRIVE_ENABLED and re.match(r'^[-\w]{20,}$', path_or_id) is not None and not os.path.exists(path_or_id))
+
+async def read_fifo_lines(fid_or_path: str, num_lines: int=1, skip_lines: int=0) -> Optional[List[str]]: # Changed num->num_lines, skip->skip_lines
+    """Reads lines from GDrive or local file based on path."""
+    if is_gdrive_path(fid_or_path):
+        actual_id=fid_or_path.split(':')[-1] if ':' in fid_or_path else fid_or_path
+        # Pass arguments correctly using keyword arguments for clarity
+        return await gdrive_read_lines(file_id=actual_id, num_lines=num_lines, skip_lines=skip_lines)
+    else:
+        # Pass arguments correctly using keyword arguments for clarity
+        return await local_read_lines(file_path=fid_or_path, num_lines=num_lines, skip_lines=skip_lines)
+
+async def append_fifo_line(fid_or_path: str, line: str) -> bool:
+    if is_gdrive_path(fid_or_path): actual_id=fid_or_path.split(':')[-1] if ':' in fid_or_path else fid_or_path; return await gdrive_append_line(actual_id, line)
+    else: return await local_append_line(fid_or_path, line)
+async def modify_fifo_line(fid_or_path: str, idx: int, new_line: str) -> bool:
+    if is_gdrive_path(fid_or_path): actual_id=fid_or_path.split(':')[-1] if ':' in fid_or_path else fid_or_path; return await gdrive_modify_line(actual_id, idx, new_line)
+    else: return await local_modify_line(fid_or_path, idx, new_line)
+async def delete_fifo_line(fid_or_path: str, idx: int=0) -> bool:
+    if is_gdrive_path(fid_or_path): actual_id=fid_or_path.split(':')[-1] if ':' in fid_or_path else fid_or_path; return await gdrive_delete_line(actual_id, idx)
+    else: return await local_delete_line(fid_or_path, idx)
+async def upload_final_transcript(local_path: str, target_dir: str, filename: str) -> Optional[str]:
+     if is_gdrive_path(target_dir): actual_id=target_dir.split(':')[-1] if ':' in target_dir else target_dir; return await gdrive_upload_file(local_path, actual_id, filename)
+     else: return await local_upload_file(local_path, target_dir, filename)
+
+# =======================================================================
+# === Local Registry Functions (SQLite PoC) =============================
+# =======================================================================
+def init_local_registry(db_path: str = LOCAL_REGISTRY_DB_FILE):
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS transcripts (video_id TEXT, tool_version TEXT, storage_path TEXT NOT NULL, checksum TEXT NOT NULL, timestamp REAL NOT NULL, PRIMARY KEY (video_id, tool_version))')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_reg_vid ON transcripts (video_id);')
+        logging.info(f"Initialized registry: {db_path}")
+    except sqlite3.Error as e: logging.critical(f"Registry init fail {db_path}: {e}"); sys.exit(1)
+def query_local_registry(video_id: str, db_path: str = LOCAL_REGISTRY_DB_FILE) -> List[Dict[str, Any]]:
+    results = []
+    try:
+        with sqlite3.connect(db_path) as conn: conn.row_factory = sqlite3.Row; cursor = conn.execute('SELECT storage_path, checksum, tool_version, timestamp FROM transcripts WHERE video_id = ? ORDER BY timestamp DESC', (video_id,)); results = [dict(row) for row in cursor.fetchall()]
+        logging.debug(f"Registry query '{video_id}': Found {len(results)}.")
+    except sqlite3.Error as e: logging.error(f"Registry query err {db_path} for {video_id}: {e}")
+    return results
+def update_local_registry(video_id: str, storage_path: str, checksum: str, tool_version: str, timestamp: float, db_path: str = LOCAL_REGISTRY_DB_FILE):
+    try:
+        with sqlite3.connect(db_path) as conn: conn.execute('INSERT OR REPLACE INTO transcripts (video_id, tool_version, storage_path, checksum, timestamp) VALUES (?, ?, ?, ?, ?)', (video_id, tool_version, storage_path, checksum, timestamp))
+        logging.info(f"Updated registry '{video_id}' (Ver: {tool_version})")
+    except sqlite3.Error as e: logging.error(f"Registry update err {db_path} for {video_id}, {tool_version}: {e}")
+
+# =======================================================================
+# === Core Processing Functions =========================================
+# =======================================================================
+# ... (get_video_metadata_async, download_progress_hook, download_video_async, convert_to_wav_async)
+# ... (transcribe_chunk_thread, diarize_and_transcribe_async - No Changes) ...
+      
+async def get_video_metadata_async(url: str) -> Optional[Dict[str, Any]]:
+    """Fetches video metadata using yt-dlp without downloading."""
+    logging.debug(f"Meta fetch start: {url}")
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "simulate": True, # Skip download
+        "skip_download": True,
+        'retries': 2,
+        'fragment_retries': 1
+    }
+    loop = asyncio.get_running_loop()
+    info = None # Initialize info
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            # Run the blocking extract_info in an executor
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+
+        # --- Corrected If/Else ---
+        if info:
+            # Success case
+            logging.debug(f"Meta fetch OK: {url}")
+            return info
+        else:
+            # Handle case where yt-dlp returns None without error
+            logging.warning(f"Meta fetch: yt-dlp returned None (no error) for: {url}.")
+            return None
+        # --- End Corrected If/Else ---
+
+    except yt_dlp.utils.DownloadError as e:
+        # Handle specific yt-dlp errors (private, deleted, region lock etc.)
+        logging.warning(f"Meta fetch fail (DownloadError): {url} ({type(e).__name__} - {e})")
+        return None
+    except Exception as e:
+        # Catch other unexpected errors during metadata fetch
+        logging.error(f"Meta fetch unexpected error: {url} ({repr(e)})")
+        # traceback.print_exc() # Uncomment for more detail if needed
+        return None
+
+    
+def download_progress_hook(d):
+    global net_speed, download_in_progress, _current_status_msg, _current_progress; status=d.get('status')
+    if status=='downloading': download_in_progress=True; _current_status_msg="Downloading"; tot=d.get('total_bytes') or d.get('total_bytes_estimate'); dl=d.get('downloaded_bytes'); sp=d.get('speed'); net_speed=float(sp) if sp else 0; _current_progress=dl/tot if tot and dl is not None else 0.0
+    elif status=='finished': download_in_progress=False; net_speed=0; _current_status_msg="DL OK"; _current_progress=1.0; logging.info(f"DL OK: {d.get('filename')}")
+    elif status=='error': download_in_progress=False; net_speed=0; _current_status_msg="DL Err"; _current_progress=0.0; logging.error(f"DL Err: {d.get('filename')}")
+
+      
+async def download_video_async(url: str, output_dir: str = TEMP_DIR) -> Optional[Tuple[str, str, str, str, str]]:
+    """Downloads video/audio using yt-dlp asynchronously."""
+    global download_in_progress, net_speed, _current_status_msg, _current_progress, _current_video_url
+
+    _current_video_url = url
+    _current_status_msg = "DL Init"
+    _current_progress = 0.0
+    os.makedirs(output_dir, exist_ok=True)
+    download_in_progress = True # Set flag before starting
+    net_speed = 0
+    loop = asyncio.get_running_loop() # Get loop once
+
+    tmpl = os.path.join(output_dir, "%(extractor)s-%(id)s.%(ext)s")
+    opts = {
+        "format": "bestaudio/best", "outtmpl": tmpl, "quiet": True,
+        "no_warnings": True, "noplaylist": True,
+        "progress_hooks": [download_progress_hook],
+        "postprocessors": [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'm4a', 'preferredquality': '192'}],
+        'retries': 5, 'fragment_retries': 5,
+        'retry_sleep_functions': {'http_error': lambda n: min(5*(2**n), 60), 'fragment': lambda n: min(3*(2**n), 30)}
+    }
+
+    info = None # Initialize info dict
+    path = None # Initialize path
+    try:
+        logging.info(f"DL Start: {url}") # Log before starting download
+
+        # --- Download With Block ---
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            # Run blocking extract_info in executor
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+        # --- End With Block ---
+
+        # Check results AFTER the download attempt completes or fails
+        if not info:
+            _current_status_msg = "DL Fail(no info)"
+            logging.error(f"yt-dlp returned None: {url}")
+            return None # download_in_progress handled by finally
+
+        # --- Successful Download Attempt ---
+        _current_status_msg = "DL OK" # Hook *should* set this, but confirm
+
+        # Extract info
+        vid = info.get("id", "XID")
+        key = info.get("extractor_key", "XExtr")
+        title = info.get("title", "XTitle")
+        chan = info.get("channel") or info.get("uploader") or "XChannel"
+        base = f"{key.lower()}-{vid}"
+        # Get path preferentially from info dict
+        path = info.get('filepath') or info.get('_filename')
+
+        # --- Corrected Fallback Search Logic ---
+        if not path:
+            logging.warning(f"No path in info dict for {base}, searching '{output_dir}'...")
+            base_low = base.lower()
+            try:
+                # Use a generator expression within next() to find the first match
+                path = next(
+                    (os.path.join(output_dir, f)
+                     for f in os.listdir(output_dir)
+                     if f.lower().startswith(base_low)),
+                    None # Default to None if no match found
+                )
+            except FileNotFoundError:
+                logging.warning(f"Directory '{output_dir}' not found during search.")
+                path = None # Ensure path is None if directory doesn't exist
+            except Exception as e:
+                logging.error(f"Error searching directory '{output_dir}': {e}")
+                path = None # Ensure path is None on other errors
+            # Log if found via search
+            if path:
+                logging.info(f"Found downloaded file via search: {path}")
+        # --- End Corrected Fallback Search ---
+
+        # --- Validate Final Path ---
+        if not path or not os.path.exists(path):
+            _current_status_msg = "DL Fail(no file)"
+            logging.error(f"DL file missing after check/search: {url} (expected base: {base})")
+            # Log directory contents for debugging if search failed
+            if not info.get('filepath') and not info.get('_filename'):
+                 try: logging.debug(f"Contents of {output_dir}: {os.listdir(output_dir)}")
+                 except: pass
+            return None
+        # --- End Validation ---
+
+        logging.info(f"DL OK: {path}")
+        return path, vid, key, title, chan
+
+    except yt_dlp.utils.DownloadError as e:
+        _current_status_msg = f"DL Fail:{type(e).__name__}"
+        logging.error(f"yt-dlp error: {url}({e})")
+        return None
+    except Exception as e:
+        _current_status_msg = f"DL Err:{type(e).__name__}"
+        logging.error(f"DL unexpected error: {url}({repr(e)})")
+        traceback.print_exc()
+        return None
+    finally:
+         # Ensure flags are reset even if unexpected error occurs
+         download_in_progress = False
+         net_speed = 0
+
+async def convert_to_wav_async(in_f: str, out_wav: str) -> Optional[str]:
+    global _current_status_msg, _current_progress; _current_status_msg="Convert WAV"; _current_progress=0.0; os.makedirs(os.path.dirname(out_wav), exist_ok=True)
+    cmd=["ffmpeg","-i",in_f,"-vn","-acodec","pcm_s16le","-ac","1","-ar","16000","-loglevel","error","-y",out_wav]; logging.info(f"Converting '{os.path.basename(in_f)}'...");
+    try:
+        p = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE); _, stderr = await p.communicate()
+        if p.returncode==0: _current_status_msg="Convert OK"; _current_progress=1.0; logging.info(f"Converted OK: {out_wav}"); return out_wav
+        else: _current_status_msg="Convert FAIL"; logging.error(f"FFmpeg fail(code {p.returncode}) for {in_f}\nStderr: {stderr.decode().strip()}"); return None
+    except FileNotFoundError: _current_status_msg="Convert FAIL(ffmpeg missing)"; logging.critical("ffmpeg missing!"); _running=False; return None
+    except Exception as e: _current_status_msg=f"Convert err:{type(e).__name__}"; logging.error(f"FFmpeg err: {repr(e)}"); traceback.print_exc(); return None
+def transcribe_chunk_thread(
+    c_id: int, model: Model, wav_path: str, s_f: int, e_f: int, res_q: queue.Queue, stat_q: queue.Queue):
+    t_name=threading.current_thread().name; logging.debug(f"{t_name}({c_id}):Start."); stat_q.put((c_id,"started"))
+    try:
+        wf=wave.open(wav_path,"rb"); rate=wf.getframerate(); wf.setpos(s_f); frames=e_f-s_f;
+        if frames<=0: logging.debug(f"{t_name}({c_id}):Skip empty."); res_q.put((c_id,"")); wf.close(); stat_q.put((c_id,"skipped")); return
+        rec=KaldiRecognizer(model,rate); rec.SetWords(True); data=wf.readframes(frames); wf.close();
+        res_json=rec.FinalResult() if rec.AcceptWaveform(data) else rec.PartialResult(); res_dict=json.loads(res_json); text=res_dict.get("text","")
+        logging.debug(f"{t_name}({c_id}):Done."); res_q.put((c_id,text)); stat_q.put((c_id,"finished"))
+    except wave.Error as e: logging.error(f"{t_name}({c_id}):Wave err:{e}"); res_q.put((c_id,"[Err:Wav]")); stat_q.put((c_id,"error"))
+    except Exception as e: logging.error(f"{t_name}({c_id}):Err:{repr(e)}"); traceback.print_exc(); res_q.put((c_id,"[Err:Tx]")); stat_q.put((c_id,"error"))
+
+async def diarize_and_transcribe_async(
+    wav_path:str, out_path:str, vid:str, title:str, chan:str, cfg:dict, tool_version: str, cleanup:bool
+    ) -> Optional[Tuple[str, Optional[str]]]:
+    """Performs diarization and transcription, returns path and checksum."""
+    global _current_status_msg,_current_progress,_current_speaker_info,max_threads,vosk_model_path,hf_token,Pipeline
+    _current_status_msg="Init";_current_progress=0.0;_current_speaker_info=""; vosk_model:Optional[Model]=None
+    try: # Load Vosk
+        if not vosk_model_path or not os.path.isdir(vosk_model_path): logging.critical(f"Bad Vosk path:'{vosk_model_path}'"); _current_status_msg="Err:VoskPath"; return None, None
+        logging.info(f"Load Vosk:{vosk_model_path}..."); _current_status_msg="Load Vosk"; loop=asyncio.get_running_loop(); vosk_model=await loop.run_in_executor(None,lambda:Model(vosk_model_path)); logging.info("Vosk OK."); _current_status_msg="Vosk OK"
+    except Exception as e: logging.critical(f"Vosk load fail:{e}"); traceback.print_exc(); _current_status_msg="Err:VoskLoad"; return None, None
+    if not vosk_model: logging.critical("Vosk model None."); _current_status_msg="Err:VoskMissing"; return None, None
+
+    segs=[]; diar_fail=False # Diarize
+    if Pipeline:
+        _current_status_msg="Diarizing";_current_progress=0.0;_current_speaker_info="(Pya)"; logging.info("Start Pyannote...");
+        if not hf_token: logging.warning("HF token missing.")
+        try:
+            logging.info("Load Pya pipe..."); pipe=Pipeline.from_pretrained("pyannote/speaker-diarization-3.1",use_auth_token=hf_token); logging.info("Pya loaded."); _current_status_msg="Run Diarize"; loop=asyncio.get_running_loop();
+            def hook(*a,**k): _current_status_msg=f"Diarizing(Proc)"; logging.debug(f"DiarHook:{a} {k}")
+            res=await loop.run_in_executor(None,lambda:pipe(wav_path,hook=hook)); segs=[(t.start,t.end,s) for t,_,s in res.itertracks(yield_label=True)]; logging.info(f"Diarize OK-{len(segs)} segs."); _current_status_msg="Diarize OK";_current_progress=1.0;_current_speaker_info=f"({len(segs)} segs)"
+        except TimeoutError: logging.error("Pya timed out.");_current_status_msg="Err:Diar Timeout";diar_fail=True
+        except Exception as e: logging.error(f"Pya fail:{repr(e)}");traceback.print_exc();_current_status_msg="Err:Diar Fail";diar_fail=True
+    else: logging.warning("Pya unavailable. Skip diarize.");diar_fail=True
+
+    _current_status_msg="Prep Tx";_current_progress=0.0 # Setup Tx
+    try: # Add try/except around wave open
+        with wave.open(wav_path,"rb") as wf: rate=wf.getframerate(); frames=wf.getnframes(); dur=frames/rate;
+    except wave.Error as e: logging.error(f"Failed to open/read WAV file {wav_path}: {e}"); return None, None
+    except Exception as e: logging.error(f"Unexpected error reading WAV {wav_path}: {e}"); return None, None
+
+    if diar_fail: logging.info("Full file Tx."); segs=[(0.0,dur,"SPKR_00")]; _current_speaker_info="(Full)"
+    n_segs=len(segs); res_q=queue.Queue(); stat_q=queue.Queue(); threads=[]; status={i:"pending" for i in range(n_segs)}; in_prog=0; done=0; res_list=[None]*n_segs # Threading
+    def update_prog(): nonlocal done,n_segs; _current_progress=done/n_segs if n_segs>0 else 0.0; _current_status_msg=f"Tx {done}/{n_segs}"; _current_speaker_info=f"({in_prog} act)"
+
+    if n_segs==0: logging.warning("No segs.");_current_status_msg="No Segs"
+    else:
+        _current_status_msg="Start Threads"; logging.info(f"Start Tx: {n_segs} segs, {max_threads} thr.")
+        seg_iter=iter(enumerate(segs)); launched=0
+        while in_prog<max_threads or done<n_segs: # Manage threads
+            while in_prog<max_threads: # Launch
+                try: c_id,(st,en,sp)=next(seg_iter); s_f=int(st*rate); e_f=int(en*rate); t=threading.Thread(target=transcribe_chunk_thread,args=(c_id,vosk_model,wav_path,s_f,e_f,res_q,stat_q),daemon=True); threads.append(t);t.start();in_prog+=1;status[c_id]="running";launched+=1;logging.debug(f"Launched {c_id}")
+                except StopIteration: break
+            if launched>=n_segs and in_prog==0: break
+            try: # Queues
+                 while not stat_q.empty():
+                     c_id, stat = stat_q.get_nowait()
+                     if stat in ["finished", "skipped", "error"]:
+                         if status.get(c_id) == "running": in_prog -= 1; done += 1; status[c_id] = stat; update_prog(); logging.debug(f"Seg {c_id} fin:{stat}")
+                     elif stat == "started":
+                         if status.get(c_id) == "pending": status[c_id] = "running"
+                     else: logging.warning(f"Unknown status for seg {c_id}: {stat}")
+                 while not res_q.empty():
+                      c_id, txt = res_q.get_nowait()
+                      if 0 <= c_id < len(res_list) and res_list[c_id] is None: res_list[c_id] = txt; logging.debug(f"Result {c_id}")
+                      elif 0 <= c_id < len(res_list): logging.warning(f"Dupe result {c_id}")
+                      else: logging.warning(f"Invalid idx result {c_id}")
+                 await asyncio.sleep(0.05)
+            except Empty: await asyncio.sleep(0.01)
+            except Exception as e: logging.error(f"Manage loop err:{repr(e)}");traceback.print_exc();await asyncio.sleep(1)
+        logging.info("Wait threads..."); _current_status_msg="Finalizing"; [t.join(10.0) for t in threads]; logging.info("Threads OK.")
+
+    _current_status_msg="Assembling";_current_progress=1.0;_current_speaker_info=""; transcript="" # Assemble
+
+    # --- Corrected Assembly Logic ---
+    if diar_fail:
+        # Simple concatenation for non-diarized or failed diarization
+        transcript_lines = []
+        for i in range(n_segs): # n_segs will be 1 in this case
+             text = res_list[i] if (i < len(res_list) and res_list[i] is not None) else "[Transcription Error]"
+             if text.strip():
+                  transcript_lines.append(text.strip())
+        transcript = "\n".join(transcript_lines)
+    else:
+        # Merge contiguous segments from the same speaker (Multi-line logic)
+        merged_segments_text = []
+        current_speaker = None
+        current_text_block = ""
+
+        for i in range(n_segs):
+            if i >= len(segs): # Bounds check
+                 logging.warning(f"Segment index {i} out of bounds during assembly.")
+                 continue
+
+            # Get speaker label from segments list
+            _start_time, _end_time, speaker_label = segs[i]
+
+            # Get corresponding text from results list, handle potential None or errors
+            segment_text = res_list[i] if (i < len(res_list) and res_list[i] is not None) else "[Transcription Error]"
+            segment_text = segment_text.strip()
+
+            # Skip segments with no actual text content
+            if not segment_text or segment_text == "[Transcription Error]":
+                 continue
+
+            # Merge logic based on speaker change
+            if speaker_label == current_speaker:
+                # Append to current speaker's block
+                current_text_block += " " + segment_text
+            else:
+                # Finish previous speaker's block if it exists
+                if current_speaker is not None and current_text_block:
+                    merged_segments_text.append((current_speaker, current_text_block.strip()))
+
+                # Start a new block for the new speaker
+                current_speaker = speaker_label
+                current_text_block = segment_text
+
+        # Append the very last block after the loop finishes
+        if current_speaker is not None and current_text_block:
+            merged_segments_text.append((current_speaker, current_text_block.strip()))
+
+        # Format the final transcript string
+        transcript = "\n\n".join(f"[{speaker}]: {text}" for speaker, text in merged_segments_text)
+    # --- End Corrected Assembly Logic ---
+
+    _current_status_msg="Saving" # Save
+    checksum = None
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path,"w",encoding="utf-8") as f: f.write(f"# Tx:{title}\n# Ch:{chan}\n# ID:{vid}\n# Tool:{tool_version}\n# Date:{datetime.datetime.now().isoformat()}\n\n---\n\n{transcript}")
+        logging.info(f"Saved OK:{out_path}"); _current_status_msg="Saved OK"
+        checksum = calculate_sha256(out_path);
+        if checksum: logging.info(f"Checksum:{checksum[:8]}...")
+        else: logging.error(f"Checksum FAILED for {out_path}")
+    except Exception as e: logging.error(f"Save fail {out_path}:{e}");_current_status_msg="Err:Save Fail"; return None, None
+
+    # Cleanup WAV file
+    if cleanup and wav_path and os.path.exists(wav_path):
+        _current_status_msg="Cleaning WAV"; logging.info(f"CleanWAV:{wav_path}");
+        try: os.remove(wav_path)
+        except OSError as e: logging.warning(f"Cannot remove WAV {wav_path}:{e}")
+        except Exception as e: logging.warning(f"Err removing WAV {wav_path}:{e}")
+    elif cleanup and wav_path: logging.debug(f"Cleanup skipped: WAV {wav_path} not found.")
+
+    return out_path, checksum
+
+# =======================================================================
+# === Main Application Logic ============================================
+# =======================================================================
+async def process_single_video( # Includes Registry Check/Update
+    video_url_or_path: str,
+    output_dir_target: str, # Final customer output (GDrive ID/Path or Local Path)
+    config: dict,
+    cleanup: bool,
+    tool_version: str, # The version string for the current tool
+    registry_db_path: str # Path to the registry DB file
+    ):
+    """Processes a single video: check registry, download, convert, transcribe, deliver, cleanup."""
+    global _current_video_file,_current_status_msg,_current_progress,_current_speaker_info,_current_video_url
+    _current_video_file=None; _current_video_url=video_url_or_path; _current_status_msg="Checking"; _current_progress=0.0; _current_speaker_info="";
+    logging.info(f"Checking:{video_url_or_path}")
+
+    original_dl_file = None # Keep track of downloaded file for cleanup across the function
+    verified_local_transcript_path = None # Path to usable local transcript copy
+    newly_gen_local_path = None # Path if we generate it now
+    new_checksum = None # Checksum if we generate it now
+    vid=None; title=None; chan=None; key="unknown" # Initialize metadata vars
+
+    try: # Wrap the entire sequence that can fail after getting basic info
+        # --- Step 1: Get Metadata & Canonical ID ---
+        is_local=os.path.isfile(video_url_or_path);
+        if is_local:
+            base=os.path.splitext(os.path.basename(video_url_or_path))[0];vid=base;title=base;chan="LocalFile";key="local"
+        else:
+            meta=await get_video_metadata_async(video_url_or_path)
+            if meta:
+                 vid=meta.get("id","XID");title=meta.get("title","XTitle");chan=meta.get("channel")or meta.get("uploader")or"XChannel";key=meta.get("extractor_key","XExtr")
+            else:
+                 logging.warning(f"No meta:{video_url_or_path}. Fallback ID."); vid="XID_"+hashlib.sha1(video_url_or_path.encode()).hexdigest()[:10];title="XTitle";chan="XChannel";key="XExtr"
+
+        if not vid: _current_status_msg="Err:No VID"; logging.error("Cannot determine video ID."); return
+
+        _current_status_msg = f"Registry {vid[:8]}.."; logging.info(f"Video ID: {vid}. Check registry...")
+
+        # --- Step 2: Check Registry & Define Versioned Filename ---
+        chan_s=create_channel_slug(chan); title_s=create_title_slug(title); fname_base=f"{chan_s}-{title_s}-{vid}"
+        versioned_fname=f"{fname_base}_v{tool_version}.txt"; is_output_gdrive=is_gdrive_path(output_dir_target)
+        final_customer_path_str = ""; # Path for registry record
+        if is_output_gdrive: folder_id = output_dir_target.split(':')[-1] if ':' in output_dir_target else output_dir_target; final_customer_path_str = f"gdriveid:{folder_id}/{versioned_fname}"
+        else: final_customer_path_str = os.path.join(output_dir_target, versioned_fname)
+
+        existing_versions = query_local_registry(vid, registry_db_path)
+        tool_pref = {"WhisperL3": 3, "WhisperM": 2, "Vosk-0.42": 1, "Vosk-0.22": 0}; current_rank = tool_pref.get(tool_version, -1) # Example pref
+
+        if existing_versions:
+            logging.info(f"Found {len(existing_versions)} registry entries for {vid}.")
+            for entry in existing_versions:
+                entry_tool=entry.get("tool_version"); entry_rank=tool_pref.get(entry_tool,-1)
+                entry_path=entry.get("storage_path"); entry_checksum=entry.get("checksum")
+                if not entry_path or not entry_checksum or entry_rank<0: continue
+                if entry_rank >= current_rank: # Found suitable version
+                    logging.info(f"Found '{entry_tool}'@'{entry_path}'. Retrieve/Verify..."); _current_status_msg=f"Retrieve {entry_tool}"; _current_progress=0.0
+                    temp_retrieved_path = os.path.join(TEMP_DIR, f"retrieved_{vid}_{entry_tool}.txt")
+                    retrieved_ok = False # --- Placeholder for retrieval ---
+                    if entry_path.startswith("gdriveid:"):
+                        if GOOGLE_DRIVE_ENABLED: logging.warning("GDrive retrieve NI.") # Needs GDrive download
+                        else: logging.error("GDrive needed for retrieval but disabled.")
+                    elif os.path.exists(entry_path): # Local path in registry
+                        try: shutil.copy2(entry_path, temp_retrieved_path); retrieved_ok = True
+                        except Exception as e: logging.error(f"Local retrieve failed {entry_path}: {e}")
+
+                    if retrieved_ok:
+                        _current_status_msg=f"Verify {entry_tool}"; retrieved_checksum=calculate_sha256(temp_retrieved_path)
+                        if retrieved_checksum and retrieved_checksum == entry_checksum:
+                            logging.info(f"Checksum OK {entry_tool}. Use cache."); verified_local_transcript_path = temp_retrieved_path
+                            _current_status_msg=f"Using {entry_tool}"; _current_progress=1.0; break # Use this
+                        else:
+                             logging.warning(f"Checksum FAIL {entry_tool}! Exp {entry_checksum[:8]}.., got {str(retrieved_checksum)[:8]}..")
+                             # Cleanup bad retrieved file only if checksum fails
+                             try: os.remove(temp_retrieved_path)
+                             except OSError as rm_e: logging.warning(f"Could not remove bad retrieved file {temp_retrieved_path}: {rm_e}")
+                    else: logging.warning(f"Retrieve fail {entry_tool} from {entry_path}.")
+                else: logging.info(f"Found older '{entry_tool}'. Skip.")
+
+        # --- Step 3: Transcribe if Necessary ---
+        if not verified_local_transcript_path:
+            logging.info(f"Transcribing with {tool_version}..."); _current_status_msg="Start Tx Pipeline"
+            dl_path=None; wav_path=None; # original_dl_file defined outside try
+            if is_local:
+                 dl_path=video_url_or_path;_current_status_msg="Proc local";_current_video_file=os.path.basename(video_url_or_path)
+            else:
+                 dl_res=await download_video_async(video_url_or_path,TEMP_DIR);
+                 if not dl_res: return # Error logged in download func
+                 dl_path,vid_dl,key_dl,t_dl,c_dl=dl_res;original_dl_file=dl_path;_current_video_file=os.path.basename(dl_path); vid,title,chan,key=vid_dl or vid,t_dl or title,c_dl or chan,key_dl or key
+
+            if not dl_path: logging.error("DL Path None after check/DL."); _current_status_msg = "Err: DL Path"; return
+
+            wav_fname=f"{key}-{vid}_converted.wav"; wav_path=os.path.join(TEMP_DIR,wav_fname)
+            wav_res=await convert_to_wav_async(dl_path,wav_path);
+            if not wav_res:
+                # Cleanup original download if conversion failed
+                if cleanup and original_dl_file and os.path.exists(original_dl_file):
+                    logging.info(f"Cleaning DL after WAV fail: {original_dl_file}")
+                    try: os.remove(original_dl_file)
+                    except OSError as e: logging.warning(f"Cannot rm DL {original_dl_file}:{e}")
+                return
+
+            local_output_path = os.path.join(TEMP_DIR, versioned_fname) # Generate in temp
+            tx_res = await diarize_and_transcribe_async(wav_res, local_output_path, vid, title, chan, config, tool_version, cleanup) # cleanup handles WAV inside
+
+            if not tx_res or tx_res[0] is None:
+                logging.error("Tx failed to produce file path.")
+                # Cleanup original download if transcription failed
+                if cleanup and original_dl_file and os.path.exists(original_dl_file):
+                     logging.info(f"Cleaning DL after Tx fail: {original_dl_file}")
+                     try: os.remove(original_dl_file)
+                     except OSError as e: logging.warning(f"Cannot rm DL {original_dl_file}:{e}")
+                return
+
+            newly_gen_local_path, new_checksum = tx_res
+            verified_local_transcript_path = newly_gen_local_path # Use this new one
+
+            # --- Step 4: Update Registry (for NEW transcript) ---
+            if newly_gen_local_path and new_checksum:
+                update_local_registry(vid, final_customer_path_str, new_checksum, tool_version, time.time(), registry_db_path)
+            elif newly_gen_local_path: # Checksum failed
+                 logging.error(f"Tx generated {newly_gen_local_path} but checksum failed. Registry NOT updated.")
+                 verified_local_transcript_path = None # Prevent delivery of bad file
+
+        # --- Step 5: Deliver to Customer Destination ---
+        if verified_local_transcript_path:
+            logging.info(f"Delivering transcript to final dest: {output_dir_target}"); _current_status_msg="Delivering"; _current_progress=0.0
+            final_fname = os.path.basename(verified_local_transcript_path)
+            delivered_ok = False
+            upload_res = await upload_final_transcript(verified_local_transcript_path, output_dir_target, final_fname)
+            if upload_res: delivered_ok=True; logging.info(f"Delivery OK (Res:{upload_res})"); _current_status_msg="Delivered OK"; _current_progress=1.0
+            else: logging.error("Delivery failed."); _current_status_msg="Err: Delivery"
+
+            # Cleanup local working copy (retrieved or newly generated in temp)
+            # Important: Do this AFTER delivery attempt
+            if os.path.exists(verified_local_transcript_path):
+                logging.debug(f"Cleaning up working copy: {verified_local_transcript_path}")
+                try: os.remove(verified_local_transcript_path)
+                except OSError as e: logging.warning(f"Cannot remove temp tx copy:{e}")
+        else:
+            logging.error("No verified transcript to deliver."); _current_status_msg="Err: No File"
+
+    # --- Outer Exception Handling for the whole process ---
+    except Exception as e:
+        logging.error(f"Error processing {video_url_or_path}: {repr(e)}")
+        traceback.print_exc()
+        _current_status_msg=f"Fatal Error: {type(e).__name__}"
+        # Fall through to cleanup below
+
+    # --- Cleanup of original download (runs after try/except) ---
+    if cleanup and original_dl_file and os.path.exists(original_dl_file):
+        logging.info(f"Final cleanup check: Removing downloaded file: {original_dl_file}")
+        try: os.remove(original_dl_file)
+        except OSError as e: logging.warning(f"Final cleanup: Could not remove downloaded file {original_dl_file}: {e}")
+        except Exception as e: logging.warning(f"Final cleanup: Unexpected error removing {original_dl_file}: {e}")
+    elif cleanup and original_dl_file: logging.debug(f"Final cleanup: Downloaded file {original_dl_file} not found, removal skipped.")
+
+    # --- End of process_single_video ---
+
+
+# =======================================================================
+# === Main Execution ====================================================
+# =======================================================================
+async def main():
+    global _running, max_threads, vosk_model_path, hf_token, resource_monitor_max_threads, array_local, _lock_file_path, gdrive_service
+
+    SCRIPT_NAME = os.path.basename(sys.argv[0]) # Get script name
+
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="Transcribe audio source(s).", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("source", help="URL, local video/audio file path, OR path to a FIFO queue file (local or gdrive:ID).")
+    parser.add_argument("--output-dir", default=None, help="Output directory for transcripts (GDrive Folder ID/Path or Local Path). Default: based on source type if FIFO, else './transcriptions'.")
+    parser.add_argument("--service-offer", default="Vosk-Default", help="Service ID for transcription (e.g., Vosk-0.22). Required for --distributed.") # Changed default
+    parser.add_argument("--distributed", action='store_true', default=False, help="Run in distributed worker mode using source as shared FIFO (Default: process source directly or as single-user FIFO).")
+    parser.add_argument("--claim-id", default=None, help="Unique worker ID for distributed mode (default: hostname_pid).")
+    parser.add_argument("--registry-db", default=LOCAL_REGISTRY_DB_FILE, help="Path to SQLite registry DB.")
+    parser.add_argument("--service-account-key", default=DEFAULT_GDRIVE_KEY_PATH, help="Path to GDrive Service Account JSON key file.")
+    parser.add_argument("--cleanup", action="store_true", help="Delete temporary files.")
+    parser.add_argument("--monitor-resources", action="store_true", help="Display system resources.")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level.")
+    args = parser.parse_args()
+
+    # --- Determine Operating Mode ---
+    is_fifo_mode = False
+    is_gdrive_source = False
+    resolved_source_path = os.path.abspath(os.path.expanduser(args.source))
+
+    if args.distributed:
+        # Distributed mode ALWAYS treats source as a FIFO path/ID
+        is_fifo_mode = True
+        is_gdrive_source = is_gdrive_path(args.source) # Check if the provided path looks like GDrive
+        logging.info(f"Running in DISTRIBUTED mode. Source treated as {'GDrive' if is_gdrive_source else 'Local'} FIFO: {args.source}")
+    elif os.path.isfile(resolved_source_path):
+        # Source is an existing local file. Assume it's a FIFO list for single-user mode.
+        is_fifo_mode = True
+        is_gdrive_source = False # Local file source
+        logging.info(f"Running in SINGLE-USER FIFO mode. Source treated as Local FIFO: {resolved_source_path}")
+        args.source = resolved_source_path # Use the resolved path
+    else:
+        # Source is not an existing file and not distributed mode. Treat as single direct task (URL or potential future local media file).
+        is_fifo_mode = False
+        is_gdrive_source = False # Doesn't apply to single task
+        logging.info(f"Running in DIRECT TASK mode. Processing source directly: {args.source}")
+
+
+    # --- Determine Effective Output Dir (can be done before lock now) ---
+    # Default changes based on mode
+    default_local_output = TRANSCRIPTIONS_DIR_LOCAL
+    default_gdrive_output = TRANSCRIPTIONS_DIR_GDRIVE # Placeholder ID/Prefix needed
+
+    if args.output_dir:
+         effective_output_dir = args.output_dir # User override
+    elif is_fifo_mode and is_gdrive_source:
+         effective_output_dir = default_gdrive_output
+    else: # Single direct task OR local FIFO mode defaults to local output
+         effective_output_dir = default_local_output
+
+    # Resolve local paths
+    final_output_dir = effective_output_dir
+    is_final_output_gdrive = is_gdrive_path(final_output_dir)
+    if not is_final_output_gdrive:
+        final_output_dir = os.path.abspath(os.path.expanduser(final_output_dir))
+
+
+    # --- Task-Specific Instance Lock ---
+    # Lock based on source FIFO/task and final output dir
+    if not acquire_instance_lock(args.source, final_output_dir): # Use final resolved dir for lock ID consistency
+        print("="*60, file=sys.stderr); print(f" [{SCRIPT_NAME}] Execution blocked: Another instance may be processing the same\n source '{args.source}' for output '{final_output_dir}'.", file=sys.stderr); print(f" Lock file: {_lock_file_path}", file=sys.stderr); print(" If certain no other valid instance is running this *specific task*,\n you may need to manually remove the lock file.", file=sys.stderr); print("-"*60, file=sys.stderr); print(" Note: Separate instances are for *different* tasks (Source/Output).", file=sys.stderr); print("="*60, file=sys.stderr); sys.exit(1)
+
+    # --- Logging Setup ---
+    log_level=getattr(logging, args.log_level.upper(), logging.INFO); log_fmt=f'%(asctime)s-%(levelname)-8s-[{SCRIPT_NAME}:%(process)d]-%(message)s'; datefmt='%Y-%m-%d %H:%M:%S'; log_file='transcription_process.log'; logging.basicConfig(level=log_level, format=log_fmt, datefmt=datefmt, handlers=[logging.FileHandler(log_file, mode='w', encoding='utf-8'), logging.StreamHandler(sys.stderr)], force=True)
+    logging.info("="*30+" Script Start "+"="*30); logging.info(f"PID:{os.getpid()} Args:{sys.argv} Parsed:{args}"); logging.info(f"Acquired lock: {_lock_file_path}")
+    logging.info(f"Mode: {'Distributed FIFO' if args.distributed else ('Single-User FIFO' if is_fifo_mode else 'Direct Task')}")
+    logging.info(f"Effective output directory: {final_output_dir}")
+
+
+    # --- Validate Args Post-Parse (Service offer needed only for distributed) ---
+    if args.distributed and args.service_offer == "DefaultTool-v1":
+         logging.critical("Arg Error: --service-offer must be specified for --distributed mode."); print("ERROR: --service-offer required for --distributed.", file=sys.stderr); sys.exit(1)
+
+    # --- Determine if GDrive Needed & Initialize ---
+    gdrive_needed = is_gdrive_path(args.source) or is_gdrive_path(final_output_dir)
+    if gdrive_needed:
+        if not await initialize_gdrive_service(args.service_account_key): logging.critical("GDrive needed but service init failed."); sys.exit(1)
+    else: logging.info("GDrive paths not detected, skipping GDrive init.")
+
+    # --- Initial Checks / Config / Token / Registry ---
+    logging.info("Initial checks...");
+    if not check_core_dependencies(): sys.exit(1)
+    if gdrive_needed and not GOOGLE_DRIVE_ENABLED: logging.critical("GDrive needed but libs missing."); sys.exit(1)
+    system_resources=check_resources_initial()
+    logging.info("Loading config..."); config=load_vosk_config(system_resources["ram_gb"]); resource_monitor_max_threads=max_threads
+    load_hf_token_if_needed()
+    logging.info("Initializing registry..."); init_local_registry(args.registry_db)
+
+    # --- Setup Timers & Callbacks ---
+    logging.info("Setup display/monitoring..."); add_timer("resource_fetch", resource_fetch, STATS_FETCH_INTERVAL_SEC, enabled=args.monitor_resources)
+    array_local = [{'enable': args.monitor_resources, 'function': update_stats_display}]
+    callback_task = asyncio.create_task(run_callbacks()); logging.info("Callback loop started.")
+
+    # --- Main Processing ---
+    start_tm = time.time()
+    processed_count = 0
+    try:
+        if is_fifo_mode:
+            # --- FIFO Processing Loop ---
+            fifo_id_or_path = args.source # Use the source arg as FIFO identifier
+            # Derive BIDS path/ID based on FIFO path/ID type
+            if is_gdrive_path(fifo_id_or_path):
+                 bids_id_or_path = f"{fifo_id_or_path}_BIDS" # Simplistic GDrive BIDS name
+            else:
+                 # Ensure fifo_id_or_path is treated as a path for dirname
+                 abs_fifo_path = os.path.abspath(os.path.expanduser(fifo_id_or_path))
+                 bids_id_or_path = os.path.join(os.path.dirname(abs_fifo_path), "BIDS")
+            logging.info(f"Starting FIFO mode. FIFO: {fifo_id_or_path}, BIDS: {bids_id_or_path}")
+            claim_id = args.claim_id or f"{platform.node().split('.')[0]}_{os.getpid()}"; claim_sig = f"{claim_id}::{args.service_offer}"; logging.info(f"Claim Sig: {claim_sig}")
+
+            while _running:
+                _current_status_msg = "Check FIFO"; _current_video_url = fifo_id_or_path; _current_progress = 0.0; logging.info(f"Checking FIFO ({fifo_id_or_path})...")
+                unclaimed_idx = -1; target_url = None # Reset before check
+
+                # Use dispatcher to read lines
+                lines = await read_fifo_lines(fifo_id_or_path, num_lines=10) # Read top lines
+
+                if lines is None:
+                     logging.error("FIFO read fail. Retrying after delay.")
+                     await asyncio.sleep(30)
+                     continue # Restart main while loop
+                if not lines:
+                     logging.info("FIFO is empty. Waiting...")
+                     _current_status_msg = "FIFO Empty"
+                     await asyncio.sleep(60)
+                     continue # Restart main while loop
+
+                # --- Corrected Loop to Find Unclaimed Task ---
+                for i, line in enumerate(lines):
+                    line = line.strip()
+                    # Check if line is valid, not comment, and not claimed
+                    if line and not line.startswith("#") and "CLAIMED_BY:" not in line:
+                        unclaimed_idx = i
+                        target_url = line # Assume line is the URL/path
+                        logging.info(f"Found unclaimed task at line {unclaimed_idx}: {target_url}")
+                        break # Stop searching once the first unclaimed is found
+
+                if unclaimed_idx == -1: logging.info("No unclaimed tasks. Wait."); _current_status_msg = "No Unclaimed"; await asyncio.sleep(30); continue
+                job_claimed = False # Process claim based on mode
+                if args.distributed: # == Distributed: Bid & Wait ==
+                    _current_status_msg=f"Bidding..."; bid_line=f"{target_url} {claim_sig}"; logging.info(f"Placing bid:{bid_line}")
+                    bid_ok=await append_fifo_line(bids_id_or_path, bid_line);
+                    if not bid_ok: logging.error("Bid fail. Retry."); await asyncio.sleep(10); continue
+                    _current_status_msg=f"Waiting Claim..."; claim_timeout=300; claim_start=time.time()
+                    while time.time()-claim_start < claim_timeout:
+                        if not _running: break; logging.debug(f"Check FIFO line {unclaimed_idx}...");
+                        claimed_data=await read_fifo_lines(fifo_id_or_path, num_lines=1, skip_lines=unclaimed_idx)
+                        if claimed_data:
+                            claimed_ln=claimed_data[0].strip(); expected_marker=f"CLAIMED_BY:{claim_sig}"
+                            if claimed_ln.endswith(expected_marker): logging.info(f"Claim OK:{target_url}"); job_claimed=True; break
+                            elif "CLAIMED_BY:" in claimed_ln: logging.warning(f"Claimed by other:{claimed_ln}."); break
+                        else: logging.error("FIFO read fail claim check."); break
+                        await asyncio.sleep(15)
+                    if not job_claimed and _running: logging.warning(f"Claim timeout/taken. Rescan."); continue
+                else: # == Single-User: Self-Claim ==
+                    _current_status_msg=f"Self-Claim..."; logging.info(f"Self-claim:{target_url}")
+                    claim_marker=f"CLAIMED_BY:{claim_sig}"; new_line=f"{target_url} {claim_marker}"
+                    claimed_ok=await modify_fifo_line(fifo_id_or_path, unclaimed_idx, new_line);
+                    if claimed_ok: logging.info(f"FIFO line {unclaimed_idx} updated."); job_claimed=True
+                    else: logging.error("Self-claim update failed. Retry."); await asyncio.sleep(10); continue
+
+                if job_claimed and _running: # Process Claimed Job
+                    logging.info(f"Processing:{target_url}")
+                    await process_single_video(target_url, final_output_dir, config, args.cleanup, args.service_offer, args.registry_db)
+                    processed_count += 1; logging.info(f"Finished:{target_url}")
+                    if not args.distributed: # Single user cleans own FIFO
+                        _current_status_msg="Clean FIFO"; logging.info(f"Removing line {unclaimed_idx} from FIFO...");
+                        del_ok=await delete_fifo_line(fifo_id_or_path, line_index=unclaimed_idx);
+                        if not del_ok: logging.error("FIFO line removal fail.")
+                    await asyncio.sleep(5) # Pause before next check
+                elif not _running: logging.info("Shutdown requested."); break
+                else: logging.info("Job not claimed. Rescan."); await asyncio.sleep(5)
+            # End of while _running loop for FIFO mode
+
+        else:
+            # --- Direct Task Mode ---
+            logging.info(f"Processing direct task: {args.source}")
+            # In direct mode, service_offer might not be strictly needed unless
+            # registry comparison logic relies on it. Using the default.
+            service_to_use = args.service_offer if args.service_offer != "DefaultTool-v1" else "Vosk-Default" # Use provided or basic default
+            await process_single_video(args.source, final_output_dir, config, args.cleanup, service_to_use, args.registry_db)
+            processed_count = 1
+            logging.info(f"Finished direct task: {args.source}")
+            # End script after single task
+            global _running
+            _running = False
+
+
+    except KeyboardInterrupt: logging.info("Kbd interrupt."); _running = False
+    except asyncio.CancelledError: logging.info("Main cancelled."); _running = False
+    except Exception as e: logging.critical(f"Fatal main loop err: {repr(e)}"); traceback.print_exc(); _running = False
+    finally:
+        logging.info("Main loop done. Final cleanup...")
+        # _running might already be False if direct task finished
+        _running = False # Ensure it's false for callback cleanup
+        if 'callback_task' in locals() and callback_task and not callback_task.done():
+            logging.debug("Cancelling callback task...")
+            callback_task.cancel();
+            try: await callback_task;
+            except asyncio.CancelledError: logging.info("Callback task cancelled.")
+            except Exception as e: logging.error(f"Callback cancel error: {e}")
+        if sys.stdout.isatty():
+             try: _,rows=shutil.get_terminal_size(fallback=(80,24)); sys.stdout.write(f"\x1b[{rows};1H\x1b[K\x1b[1A\x1b[K\x1b[1A\x1b[K"); sys.stdout.flush()
+             except Exception as screen_e: logging.warning(f"Screen clear error:{screen_e}")
+        duration = time.time() - start_tm; logging.info(f"Processed {processed_count} task(s)."); logging.info(f"Total time: {datetime.timedelta(seconds=duration)}")
+        logging.info("="*30 + " Script End " + "="*30)
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    if os.name != 'nt': signal.signal(signal.SIGINT, handle_exit_signals); signal.signal(signal.SIGTERM, handle_exit_signals)
+    else: signal.signal(signal.SIGINT, handle_exit_signals)
+    try: os.makedirs(TEMP_DIR, exist_ok=True)
+    except OSError as e: print(f"Err: Cannot make temp dir {TEMP_DIR}:{e}", file=sys.stderr); sys.exit(1)
+    try: asyncio.run(main())
+    except KeyboardInterrupt: print("\nKbdInterrupt early.", file=sys.stderr)
+    except Exception as e: print(f"\nCritical script err: {repr(e)}", file=sys.stderr); traceback.print_exc()
+    finally: release_instance_lock()
+    print("Exiting.", file=sys.stderr)
